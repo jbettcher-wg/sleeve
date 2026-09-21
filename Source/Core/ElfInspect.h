@@ -40,6 +40,9 @@ struct ElfDetails {
 // Fast 64-byte probe without logging or full parsing
 ProbeResult ProbeFile(const std::string& path);
 
+// Checks if a probed binary matches the active backend's target architecture
+bool IsTargetBinary(const ProbeResult& probe);
+
 // Detailed inspection for AArch64 binaries (reads PT_INTERP, DT_NEEDED)
 std::optional<ElfDetails> InspectAArch64(const std::string& path);
 

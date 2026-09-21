@@ -3,6 +3,7 @@
 #include "ElfInspect.h"
 #include "Paths.h"
 #include "Shapes.h"
+#include "Backend.h"
 
 #include <filesystem>
 #include <fstream>
@@ -84,33 +85,30 @@ static void ScanDirectoryRecursive(const std::string& rootDir, const ScanOptions
     stats.files_probed++;
 
     auto probe = ElfInspect::ProbeFile(pathStr);
-    switch (probe.kind) {
-      case ElfInspect::FileKind::Foreign_PPC64LE:
-        stats.ppc64le_skipped++;
-        break;
-      case ElfInspect::FileKind::Foreign_X86_64:
-        stats.x86_64_skipped++;
-        break;
-      case ElfInspect::FileKind::Foreign_Other:
-      case ElfInspect::FileKind::NotElf:
-      case ElfInspect::FileKind::Unknown:
-        stats.other_skipped++;
-        break;
-      case ElfInspect::FileKind::AArch64_Exec:
-      case ElfInspect::FileKind::AArch64_Dyn: {
-        auto details = ElfInspect::InspectAArch64(pathStr);
-        if (details) {
-          // If it has an interpreter or is an executable or standalone runtime
-          if (details->probe.has_interp || details->probe.type == 2 /* ET_EXEC */ || details->file_size > 20 * 1024 * 1024) {
-            std::string parentDir = entry.path().parent_path().string();
-            dirToAArch64Binaries[parentDir].push_back(pathStr);
-            loneBinaries.push_back({pathStr, *details});
-          }
-        }
-        break;
+    if (ElfInspect::IsTargetBinary(probe)) {
+      auto details = ElfInspect::InspectAArch64(pathStr);
+      ElfInspect::ElfDetails det;
+      if (details) {
+        det = *details;
+      } else {
+        det.probe = probe;
+        det.file_size = fs::file_size(entry.path(), ec);
       }
-      default:
-        break;
+      std::string parentDir = entry.path().parent_path().string();
+      dirToAArch64Binaries[parentDir].push_back(pathStr);
+      loneBinaries.push_back({pathStr, det});
+    } else {
+      switch (probe.kind) {
+        case ElfInspect::FileKind::Foreign_PPC64LE:
+          stats.ppc64le_skipped++;
+          break;
+        case ElfInspect::FileKind::Foreign_X86_64:
+          stats.x86_64_skipped++;
+          break;
+        default:
+          stats.other_skipped++;
+          break;
+      }
     }
 
     iter.increment(ec);
@@ -174,11 +172,20 @@ static void ScanBinDirectory(std::vector<ForeignLauncher>& foreignLaunchers) {
         isManaged = true;
         break;
       }
-      if (line.find("POWERARM_ROOTFS=") != std::string::npos) {
+      if (line.find("POWERARM_ROOTFS=") != std::string::npos || line.find("FEX_ROOTFS=") != std::string::npos) {
         auto eq = line.find('=');
         rootfs = line.substr(eq + 1);
+        if (rootfs.rfind("${", 0) == 0) {
+          auto col = rootfs.find(":-");
+          if (col != std::string::npos) {
+            rootfs = rootfs.substr(col + 2);
+            if (!rootfs.empty() && rootfs.back() == '}') rootfs.pop_back();
+          }
+        }
       }
-      if (line.rfind("exec ", 0) == 0) {
+      if (line.find("steam.sh") != std::string::npos) {
+        execLine = Paths::ExpandUser("~/.local/share/Steam/steam.sh");
+      } else if (line.rfind("exec ", 0) == 0) {
         execLine = line.substr(5);
       }
     }
@@ -199,7 +206,7 @@ static void ScanBinDirectory(std::vector<ForeignLauncher>& foreignLaunchers) {
       targetExe = Paths::ExpandUser(targetExe);
       if (fs::exists(targetExe, ec)) {
         auto probe = ElfInspect::ProbeFile(targetExe);
-        if (probe.kind == ElfInspect::FileKind::AArch64_Exec || probe.kind == ElfInspect::FileKind::AArch64_Dyn) {
+        if (ElfInspect::IsTargetBinary(probe) || targetExe.find("steam.sh") != std::string::npos) {
           foreignLaunchers.push_back({name, path, targetExe, rootfs});
         }
       }
@@ -244,11 +251,13 @@ ScanResult RunScan(const ScanOptions& options) {
   std::map<std::string, std::vector<std::string>> appDirs;
   for (const auto& [dir, bins] : dirToBinaries) {
     std::string appRoot = dir;
-    // Check if dir ends in /bin or /bin/arm64
+    // Check if dir ends in /bin or /bin/arm64 or /bin/x64
     if (fs::path(dir).filename() == "bin") {
       appRoot = fs::path(dir).parent_path().string();
-    } else if (fs::path(dir).filename() == "arm64" && fs::path(dir).parent_path().filename() == "bin") {
+    } else if ((fs::path(dir).filename() == "arm64" || fs::path(dir).filename() == "x64") && fs::path(dir).parent_path().filename() == "bin") {
       appRoot = fs::path(dir).parent_path().parent_path().string();
+    } else if (fs::path(dir).parent_path().filename() == "Steam" || fs::path(dir).parent_path().parent_path().filename() == "Steam") {
+      appRoot = Paths::ExpandUser("~/.local/share/Steam");
     }
     for (const auto& b : bins) {
       appDirs[appRoot].push_back(b);

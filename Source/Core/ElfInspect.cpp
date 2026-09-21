@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "ElfInspect.h"
+#include "Backend.h"
 
 #include <elf.h>
 #include <fcntl.h>
@@ -62,6 +63,13 @@ ProbeResult ProbeFile(const std::string& path) {
       } else {
         res.kind = FileKind::Foreign_Other;
       }
+    } else if (n >= 52 && elf_class == ELFCLASS32 && elf_data == ELFDATA2LSB) {
+      Elf32_Ehdr ehdr;
+      std::memcpy(&ehdr, hdr, sizeof(ehdr));
+
+      res.machine = ehdr.e_machine;
+      res.type = ehdr.e_type;
+      res.kind = FileKind::Foreign_Other;
     } else {
       res.kind = FileKind::Foreign_Other;
     }
@@ -194,6 +202,16 @@ std::optional<ElfDetails> InspectAArch64(const std::string& path) {
 
   ::close(fd);
   return details;
+}
+
+bool IsTargetBinary(const ProbeResult& probe) {
+  const auto& backend = Backend::GetActiveBackend();
+  if (backend.targetArch == Backend::TargetArch::AArch64) {
+    return probe.kind == FileKind::AArch64_Exec || probe.kind == FileKind::AArch64_Dyn || probe.machine == EM_AARCH64;
+  } else if (backend.targetArch == Backend::TargetArch::X86_64) {
+    return probe.machine == EM_X86_64 || probe.machine == EM_386 || probe.kind == FileKind::Foreign_X86_64;
+  }
+  return false;
 }
 
 } // namespace Sleeve::ElfInspect

@@ -98,6 +98,37 @@ std::optional<AppCandidate> DetectDirectoryShape(const std::string& dirPath, con
   cand.dir = dirPath;
   cand.version = ExtractVersionFromPath(dirPath);
 
+  // 0. Steam Detection
+  bool hasSteamSh = fs::exists(dirPath + "/steam.sh");
+  bool hasSteam32 = fs::exists(dirPath + "/ubuntu12_32/steam");
+  bool hasSteamWeb = fs::exists(dirPath + "/ubuntu12_64/steamwebhelper");
+  if (hasSteamSh || hasSteam32 || hasSteamWeb) {
+    cand.shape = ShapeType::Game;
+    cand.name = "steam";
+    cand.title = "Steam";
+    cand.exe_path = hasSteamSh ? (dirPath + "/steam.sh") : (dirPath + "/ubuntu12_32/steam");
+    cand.default_args = {"-tcp"};
+    cand.default_env["FEX_HOSTPAGEMODE"] = "force";
+    cand.desktop_enabled = true;
+    cand.wmclass = "Steam";
+    cand.exec_field = "%U";
+
+    std::vector<std::string> steamIcons = {
+      dirPath + "/public/steam_tray.ico",
+      "/usr/share/pixmaps/steam.png",
+      "/usr/share/icons/hicolor/256x256/apps/steam.png",
+      "/usr/share/icons/hicolor/48x48/apps/steam.png"
+    };
+    for (const auto& ic : steamIcons) {
+      std::error_code ec;
+      if (fs::exists(ic, ec)) {
+        cand.icon_path = ic;
+        break;
+      }
+    }
+    return cand;
+  }
+
   // 1. Electron Detection
   bool hasCrashpad = fs::exists(dirPath + "/chrome_crashpad_handler");
   bool hasV8 = fs::exists(dirPath + "/v8_context_snapshot.bin");
