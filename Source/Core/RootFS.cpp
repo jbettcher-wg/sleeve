@@ -2,6 +2,7 @@
 #include "RootFS.h"
 #include "Paths.h"
 #include "Record.h"
+#include "Backend.h"
 
 #include <filesystem>
 #include <fstream>
@@ -83,16 +84,36 @@ static std::string ReadConfigJsonDefaultRootFS() {
 DiscoveryResult DiscoverRootFSes() {
   DiscoveryResult result;
 
-  const char* envRfs = std::getenv("POWERARM_ROOTFS");
-  if (envRfs) {
+  const auto& backend = Backend::GetActiveBackend();
+  std::string envVarName = backend.envPrefix + "ROOTFS";
+  const char* envRfs = std::getenv(envVarName.c_str());
+  if (envRfs && envRfs[0] != '\0') {
     result.env_rootfs = envRfs;
   }
   result.config_default_rootfs = ReadConfigJsonDefaultRootFS();
 
   std::vector<std::string> searchDirs = {
     Paths::GetDataDir() + "/RootFS",
-    "/usr/share/powerarm/RootFS"
+    "/usr/share/" + backend.dataSubdir + "/RootFS"
   };
+
+  const char* home = std::getenv("HOME");
+  if (home) {
+    searchDirs.push_back(std::string(home) + "/Development/fexrootfs/RootFS");
+    searchDirs.push_back(std::string(home) + "/Development/powerarm/RootFS");
+  }
+
+  if (!result.env_rootfs.empty()) {
+    std::error_code ec;
+    fs::path p = Paths::ExpandUser(result.env_rootfs);
+    if (fs::exists(p, ec)) {
+      if (fs::is_directory(p, ec)) {
+        searchDirs.push_back(p.parent_path().string());
+      } else {
+        searchDirs.push_back(p.parent_path().string());
+      }
+    }
+  }
 
   auto records = Record::ListRecords();
   std::map<std::string, std::vector<std::string>> rootfsToApps;
@@ -117,16 +138,21 @@ DiscoveryResult DiscoverRootFSes() {
         continue;
       }
 
+      std::string baseName = filename;
+      if (baseName.size() > 5 && baseName.rfind(".sqsh") == baseName.size() - 5) {
+        baseName = baseName.substr(0, baseName.size() - 5);
+      }
+
       std::string fullPath = entry.path().string();
-      if (seenBases.count(filename)) continue;
-      seenBases.insert(filename);
+      if (seenBases.count(baseName)) continue;
+      seenBases.insert(baseName);
 
       RootFSInfo info;
-      info.name = filename;
+      info.name = baseName;
       info.base_path = fullPath;
       info.base_size_bytes = CalculateDirSize(fullPath);
 
-      std::string overlayPath = sDir + "/" + filename + "-overlay";
+      std::string overlayPath = sDir + "/" + baseName + "-overlay";
       if (fs::exists(overlayPath, ec) && fs::is_directory(overlayPath, ec)) {
         info.has_overlay = true;
         info.overlay_path = overlayPath;
@@ -148,18 +174,24 @@ DiscoveryResult DiscoverRootFSes() {
       }
 
       if (!result.env_rootfs.empty()) {
-        if (result.env_rootfs == fullPath || result.env_rootfs == filename) {
+        std::string envNorm = Paths::ExpandUser(result.env_rootfs);
+        if (envNorm == fullPath || result.env_rootfs == baseName || result.env_rootfs == filename ||
+            envNorm == (sDir + "/" + baseName)) {
           info.is_env_default = true;
         }
       }
       if (!result.config_default_rootfs.empty()) {
-        if (result.config_default_rootfs == fullPath || result.config_default_rootfs == filename) {
+        std::string cfgNorm = Paths::ExpandUser(result.config_default_rootfs);
+        if (cfgNorm == fullPath || result.config_default_rootfs == baseName || result.config_default_rootfs == filename ||
+            cfgNorm == (sDir + "/" + baseName)) {
           info.is_config_default = true;
         }
       }
 
       if (rootfsToApps.count(fullPath)) {
         info.used_by_apps = rootfsToApps[fullPath];
+      } else if (rootfsToApps.count(baseName)) {
+        info.used_by_apps = rootfsToApps[baseName];
       } else if (rootfsToApps.count(filename)) {
         info.used_by_apps = rootfsToApps[filename];
       }
