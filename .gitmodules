@@ -1,0 +1,6 @@
+[submodule "External/Catch2"]
+	path = External/Catch2
+	url = https://github.com/catchorg/Catch2.git
+[submodule "External/ftxui"]
+	path = External/ftxui
+	url = https://github.com/ArthurSonzogni/FTXUI.git
