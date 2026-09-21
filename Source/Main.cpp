@@ -12,6 +12,7 @@
 #include "ElfInspect.h"
 #include "AppConfigWriter.h"
 #include "Health.h"
+#include "Backend.h"
 
 #include <iostream>
 #include <vector>
@@ -24,10 +25,11 @@ namespace fs = std::filesystem;
 using namespace Sleeve;
 
 static void PrintHelp() {
-  std::cout << "sleeve - POWERarm app manager\n\n"
+  const auto& backend = Backend::GetActiveBackend();
+  std::cout << "sleeve - emulated app manager (" << backend.displayName << ")\n\n"
             << "Usage:\n"
             << "  sleeve                               Launch terminal UI\n"
-            << "  sleeve scan [DIR...] [--json]        Scan directories for arm64 apps\n"
+            << "  sleeve scan [DIR...] [--json]        Scan directories for " << backend.archName << " apps\n"
             << "  sleeve add PATH [--name N] [--yes]   Add an app from directory or binary\n"
             << "  sleeve import PATH [--name N]        Import a foreign launcher into a managed record\n"
             << "  sleeve show NAME [--json]            Show app details\n"
@@ -39,6 +41,7 @@ static void PrintHelp() {
             << "  sleeve rootfs use NAME [--dry-run]   Set default RootFS in Config.json\n"
             << "  sleeve theme                         Show resolved theme palette\n\n"
             << "Global options:\n"
+            << "  --backend ID                         Target emulator backend (powerarm, fastppcx86)\n"
             << "  --theme FILE                         Path to custom colors.toml\n"
             << "  --json                               Output results in JSON format\n"
             << "  --dry-run                            Show diffs without writing files\n"
@@ -47,6 +50,11 @@ static void PrintHelp() {
 }
 
 int main(int argc, char** argv) {
+  const char* envBackend = std::getenv("SLEEVE_BACKEND");
+  if (envBackend && envBackend[0] != '\0') {
+    Backend::SetActiveBackend(envBackend);
+  }
+
   std::vector<std::string> args;
   for (int i = 1; i < argc; ++i) {
     args.push_back(argv[i]);
@@ -62,6 +70,17 @@ int main(int argc, char** argv) {
     if (args[i] == "--help" || args[i] == "-h") {
       PrintHelp();
       return 0;
+    } else if (args[i] == "--backend" && i + 1 < args.size()) {
+      if (!Backend::SetActiveBackend(args[++i])) {
+        std::cerr << "Unknown backend: " << args[i] << " (valid: powerarm, fastppcx86)\n";
+        return 1;
+      }
+    } else if (args[i].rfind("--backend=", 0) == 0) {
+      std::string id = args[i].substr(10);
+      if (!Backend::SetActiveBackend(id)) {
+        std::cerr << "Unknown backend: " << id << " (valid: powerarm, fastppcx86)\n";
+        return 1;
+      }
     } else if (args[i] == "--json") {
       jsonOutput = true;
     } else if (args[i] == "--dry-run") {
