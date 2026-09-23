@@ -10,6 +10,10 @@ add_executable(SleeveTests
   Test_Health.cpp
   Test_Record.cpp
   Test_Scanner.cpp
+  # The TUI's background-work layer. It deliberately depends on nothing but the standard
+  # library, so the start/progress/cancel/result contract is testable without a terminal.
+  ${CMAKE_CURRENT_SOURCE_DIR}/../Source/Tui/Job.cpp
+  Test_Job.cpp
 )
 
 target_link_libraries(SleeveTests PRIVATE
@@ -20,6 +24,7 @@ target_link_libraries(SleeveTests PRIVATE
 target_include_directories(SleeveTests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../Source
   ${CMAKE_CURRENT_SOURCE_DIR}/../Source/Core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../Source/Tui
   ${CMAKE_CURRENT_SOURCE_DIR}/../External/tiny-json
 )
 

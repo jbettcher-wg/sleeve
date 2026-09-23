@@ -42,6 +42,7 @@ target_include_directories(SleeveCore PUBLIC
 
 # Main executable
 set(SLEEVE_TUI_SRCS
+  Source/Tui/Job.cpp
   Source/Tui/App.cpp
   Source/Tui/MainScreen.cpp
   Source/Tui/ScanScreen.cpp
