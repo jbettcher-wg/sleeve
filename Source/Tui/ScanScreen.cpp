@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "App.h"
+#include "Actions.h"
 #include "Paths.h"
 
 #include <ftxui/component/component.hpp>
@@ -15,42 +16,36 @@ using namespace ftxui;
 
 Component CreateScanScreen(AppState* state, ScreenInteractive* screen) {
   auto container = Container::Vertical({});
+  auto checkboxes = Container::Vertical({});
 
-  auto btn_add = Button(" Add Selected ", [state, screen]() {
-    for (size_t i = 0; i < state->scan_result.apps.size(); ++i) {
-      if (i < state->scan_selected.size() && state->scan_selected[i].selected) {
-        const auto& cand = state->scan_result.apps[i];
-        std::string defRootfs = !state->rootfs_result.rootfses.empty() ? state->rootfs_result.rootfses[0].base_path : "";
-        auto rec = Record::CreateFromCandidate(cand, defRootfs);
-        Record::SaveRecord(rec);
-      }
+  // The list used to be built once, here, from a scan result that was still empty --
+  // and never again. Every scan therefore ended on a screen that said "Empty container"
+  // under a header claiming it had found eight apps. Rebuilding is now tied to the
+  // result changing, and runs on the UI thread out of Job::Collect.
+  auto rebuild = [state, checkboxes]() {
+    checkboxes->DetachAllChildren();
+    if (state->scan_selected.size() < state->scan_result.apps.size()) {
+      state->scan_selected.resize(state->scan_result.apps.size(), {true});
     }
-    state->Refresh();
-    state->current_tab = ScreenTab::Main;
-    screen->PostEvent(Event::Custom);
-  });
+    for (size_t i = 0; i < state->scan_result.apps.size(); ++i) {
+      const auto& app = state->scan_result.apps[i];
+      std::string label = app.name + " (" + app.title + ") - " +
+                          Shapes::ShapeToString(app.shape) + " [" +
+                          Paths::ContractUser(app.exe_path) + "]";
+      checkboxes->Add(Checkbox(label, &state->scan_selected[i].selected));
+    }
+  };
+  state->on_scan_result_changed = rebuild;
+  rebuild();
 
-  auto btn_rescan = Button(" Rescan ", [state, screen]() {
-    Scanner::ScanOptions opt;
-    state->scan_result = Scanner::RunScan(opt);
-    state->scan_selected.assign(state->scan_result.apps.size(), {true});
-    screen->PostEvent(Event::Custom);
-  });
-
+  auto btn_add = Button(" Add Selected ", [state]() { StartAddSelected(*state); });
+  auto btn_rescan = Button(" Rescan ", [state]() { StartScan(*state); });
   auto btn_back = Button(" Back ", [state, screen]() {
     state->current_tab = ScreenTab::Main;
     screen->PostEvent(Event::Custom);
   });
 
   auto buttons = Container::Horizontal({btn_add, btn_rescan, btn_back});
-
-  auto checkboxes = Container::Vertical({});
-  for (size_t i = 0; i < state->scan_result.apps.size(); ++i) {
-    if (i >= state->scan_selected.size()) state->scan_selected.push_back({true});
-    const auto& app = state->scan_result.apps[i];
-    std::string label = app.name + " (" + app.title + ") - " + Shapes::ShapeToString(app.shape) + " [" + Paths::ContractUser(app.exe_path) + "]";
-    checkboxes->Add(Checkbox(label, &state->scan_selected[i].selected));
-  }
 
   container->Add(checkboxes);
   container->Add(buttons);
@@ -61,11 +56,15 @@ Component CreateScanScreen(AppState* state, ScreenInteractive* screen) {
        << std::fixed << std::setprecision(1) << state->scan_result.stats.elapsed_seconds << " s · "
        << state->scan_result.stats.files_probed << " files probed";
 
+    Element list = state->scan_result.apps.empty()
+                       ? Element(text("Nothing found. [r] rescans from this screen.") | dim)
+                       : (checkboxes->Render() | vscroll_indicator | frame);
+
     return vbox({
       text(" Scan Results ") | bold,
       text(ss.str()) | dim,
       separator(),
-      checkboxes->Render() | vscroll_indicator | frame | flex,
+      list | flex,
       separator(),
       buttons->Render(),
     }) | borderRounded;

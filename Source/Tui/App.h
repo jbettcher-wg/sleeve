@@ -6,7 +6,10 @@
 #include "RootFS.h"
 #include "Theme.h"
 #include "Health.h"
+#include "Job.h"
 
+#include <atomic>
+#include <functional>
 #include <vector>
 #include <string>
 #include <memory>
@@ -59,6 +62,37 @@ struct AppState {
 
   // Health state
   Health::CheckResult current_health_result;
+
+  // --- Background work ---
+  //
+  // One job at a time. The actions on offer here are mutually exclusive as far as the
+  // person is concerned -- a scan, a health check, a write -- and a single slot is what
+  // makes a second press of a key while its action runs a no-op rather than a race.
+  Job job;
+
+  // Read by the repaint ticker thread, which is why it is an atomic and not job.Running().
+  std::atomic<bool> ui_busy {false};
+
+  // One line about whatever finished last: the result, the cancellation or the failure.
+  std::string status_line;
+
+  // Whatever RunTui was told to use, kept so a theme reload can ask for it again.
+  std::string theme_override;
+
+  // Set by the scan screen. The checkbox list used to be built once, when the result was
+  // still empty, and never rebuilt -- so the screen read "Empty container" after every
+  // scan. Delivering a scan result calls this, on the UI thread, to rebuild it.
+  std::function<void()> on_scan_result_changed;
+
+  // A health check starts the application for real. Nothing is launched until this has
+  // been shown and accepted.
+  struct PendingLaunch {
+    bool active {false};
+    std::string app_name;
+    std::string command;
+    std::string warning;
+  };
+  PendingLaunch pending_launch;
 
   void Refresh();
 };

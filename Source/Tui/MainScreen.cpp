@@ -146,12 +146,14 @@ Component CreateMainScreen(AppState* state, ScreenInteractive* screen) {
     auto right_pane = window(text(" Details ") | bold, right_content) | flex;
 
     // Bottom keys line
+    // Only keys that are actually bound. [a] add and [r] rootfs were advertised here for
+    // screens the tab container has never contained, so they read as more of the
+    // shortcuts that "do nothing".
     auto keys_line = hbox({
       text(" [s]") | bold | color(accentCol), text(" scan  "),
-      text("[a]") | bold | color(accentCol), text(" add  "),
       text("[enter]") | bold | color(accentCol), text(" options  "),
       text("[w]") | bold | color(accentCol), text(" write files  "),
-      text("[r]") | bold | color(accentCol), text(" rootfs  "),
+      text("[h]") | bold | color(accentCol), text(" health check  "),
       text("[t]") | bold | color(accentCol), text(" theme  "),
       text("[q]") | bold | color(accentCol), text(" quit "),
     });
