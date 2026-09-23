@@ -133,8 +133,14 @@ int main(int argc, char** argv) {
                   << "      \"target_exe\": \"" << f.target_exe << "\"\n"
                   << "    }" << (i + 1 < result.foreign_launchers.size() ? "," : "") << "\n";
       }
-      std::cout << "  ],\n  \"stats\": {\n"
+      std::cout << "  ],\n  \"searched_dirs\": [";
+      for (size_t i = 0; i < result.searched_dirs.size(); ++i) {
+        std::cout << (i > 0 ? ", " : "") << "\"" << result.searched_dirs[i] << "\"";
+      }
+      std::cout << "],\n  \"explicit_dirs\": " << (result.explicit_dirs ? "true" : "false") << ",\n"
+                << "  \"stats\": {\n"
                 << "    \"files_probed\": " << result.stats.files_probed << ",\n"
+                << "    \"duplicates_collapsed\": " << result.stats.duplicates_collapsed << ",\n"
                 << "    \"elapsed_seconds\": " << result.stats.elapsed_seconds << "\n"
                 << "  }\n}\n";
     } else {
