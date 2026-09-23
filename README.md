@@ -73,6 +73,31 @@ sleeve theme
 
 ---
 
+## Interactive TUI
+
+`sleeve` with no arguments opens the terminal interface.
+
+| key | does |
+|---|---|
+| `Tab` / `Shift+Tab` | move between screens |
+| `Up` / `Down` | move the selection |
+| `Enter` | open the selected app's options |
+| `s` | scan for applications |
+| `w` | build the launcher / desktop / AppConfig preview, then write |
+| `h` | health check the selected app — shows the command line first and launches nothing until you confirm |
+| `t` | reload the theme |
+| `Esc` | back a screen, or cancel a running action |
+| `q` | quit |
+
+Anything that takes time — scanning, health checks, theme reloads, building a preview, writing files
+— runs off the event loop. The keypress repaints immediately into a panel with a live spinner and an
+elapsed counter, the rest of the interface keeps responding while the work runs, and `Esc` cancels.
+One action runs at a time: pressing the same key again says it is still going rather than starting a
+second. Writing files is the one exception that cannot be interrupted — a launcher pointing at an
+AppConfig that was never written is worse than waiting for three short files.
+
+---
+
 ## Building and Testing
 
 Requirements: C++20 compiler (`g++` or `clang++`), `cmake` >= 3.20, and `ninja`.
@@ -85,6 +110,6 @@ git submodule update --init --recursive
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 
-# Run unit test suite (Catch2)
+# Run unit test suite (Catch2) -- 50 tests
 ctest --test-dir build --output-on-failure
 ```
