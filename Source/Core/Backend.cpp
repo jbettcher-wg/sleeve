@@ -10,11 +10,14 @@ static BackendSpec g_powerarm = {
   .envPrefix = "POWERARM_",
   .configSubdir = "powerarm",
   .dataSubdir = "powerarm",
+  .devSubdir = "powerarm",
   .targetArch = TargetArch::AArch64,
   .elfMachine = 183, // EM_AARCH64
   .archName = "arm64",
   .defaultRootfsBase = "ArchLinuxARM-m2",
   .defaultRootfsDesktop = "ArchLinuxARM-vk",
+  .binfmtName = "POWERarm-aarch64",
+  .stableOptDir = "powerarm-stable",
 };
 
 static BackendSpec g_fastppcx86 = {
@@ -24,11 +27,14 @@ static BackendSpec g_fastppcx86 = {
   .envPrefix = "FEX_",
   .configSubdir = "fex-emu",
   .dataSubdir = "fex-emu",
+  .devSubdir = "fexrootfs",
   .targetArch = TargetArch::X86_64,
   .elfMachine = 62, // EM_X86_64
   .archName = "x86_64",
   .defaultRootfsBase = "Ubuntu-24.04",
   .defaultRootfsDesktop = "Ubuntu-24.04",
+  .binfmtName = "FEX-x86_64",
+  .stableOptDir = "fastppcx86-stable",
 };
 
 static BackendSpec* g_activeBackend = &g_powerarm;

@@ -27,6 +27,8 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
   auto input_wmclass = Input(&state->editing_record.desktop.wmclass, "WMClass");
 
   auto cb_desktop = Checkbox("Enable Desktop Entry", &state->editing_record.desktop.enabled);
+  auto cb_startup_notify = Checkbox("Startup notification (spins forever under emulation)",
+                                    &state->editing_record.desktop.startup_notify);
 
   // Emulator options
   auto cb_code_cache = Checkbox("Enable Code Caching (WIP)", &state->edit_code_cache);
@@ -38,24 +40,9 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
   auto input_emulator = Input(&state->edit_emulator_path, "stable via binfmt or /path/to/POWERarm");
 
   auto btn_preview = Button(" Preview & Write ", [state, screen, scope_entries]() {
-    // Parse edit_args_str into args
-    state->editing_record.args.clear();
-    std::istringstream as(state->edit_args_str);
-    std::string arg;
-    while (as >> arg) {
-      state->editing_record.args.push_back(arg);
-    }
-
-    // Parse edit_env_str into env
-    state->editing_record.env.clear();
-    std::istringstream es(state->edit_env_str);
-    std::string envPair;
-    while (es >> envPair) {
-      auto eq = envPair.find('=');
-      if (eq != std::string::npos) {
-        state->editing_record.env[envPair.substr(0, eq)] = envPair.substr(eq + 1);
-      }
-    }
+    // Quote-aware: an argument or an env value may contain a space.
+    state->editing_record.args = Record::SplitArgsFromEditing(state->edit_args_str);
+    state->editing_record.env = Record::SplitEnvFromEditing(state->edit_env_str);
 
     // Update emulator options
     state->editing_record.appconfig["EnableCodeCachingWIP"] = state->edit_code_cache ? "1" : "0";
@@ -122,6 +109,7 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
   container->Add(input_rootfs);
   container->Add(cb_desktop);
   container->Add(input_wmclass);
+  container->Add(cb_startup_notify);
   container->Add(cb_code_cache);
   container->Add(radio_scope);
   container->Add(cb_cmp_fusion);
@@ -131,7 +119,7 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
   container->Add(buttons);
 
   return Renderer(container, [state, input_exe, input_args, input_env, input_rootfs,
-                             cb_desktop, input_wmclass, cb_code_cache, radio_scope,
+                             cb_desktop, cb_startup_notify, input_wmclass, cb_code_cache, radio_scope,
                              cb_cmp_fusion, cb_profile_stats, cb_mangohud, input_emulator, buttons]() {
     return vbox({
       text(" Options: " + state->editing_record.name) | bold,
@@ -145,6 +133,7 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
       text("Desktop Entry") | bold | color(Color::Palette16(3)),
       cb_desktop->Render(),
       hbox({ text("WMClass:     ") | bold, input_wmclass->Render() | flex }),
+      cb_startup_notify->Render(),
       separator(),
       text("Emulator Settings (written to AppConfig/" + state->editing_record.name + ".json)") | bold | color(Color::Palette16(3)),
       cb_code_cache->Render(),

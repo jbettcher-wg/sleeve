@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <climits>
 #include <filesystem>
+#include <iterator>
 
 namespace Sleeve::Paths {
 
@@ -40,6 +41,59 @@ std::string ContractUser(const std::string& path) {
     return "~" + path.substr(homeStr.size());
   }
   return path;
+}
+
+std::string PreferStableSymlinkPath(const std::string& path) {
+  std::error_code ec;
+  fs::path target(path);
+  if (path.empty() || !fs::exists(target, ec)) return path;
+
+  fs::path parent = target.parent_path();
+  if (parent.empty()) return path;
+
+  fs::path resolvedTarget = fs::weakly_canonical(target, ec);
+  if (ec) return path;
+
+  // `current` and friends first; then any alias whose name carries no version digits.
+  static const char* kPreferred[] = {"current", "latest", "stable", "default", "active"};
+  constexpr int kDigitFreeRank = 100;
+
+  std::string bestName;
+  int bestRank = kDigitFreeRank + 1;
+
+  fs::directory_iterator it(parent, fs::directory_options::skip_permission_denied, ec);
+  if (ec) return path;
+
+  for (const auto& entry : it) {
+    std::error_code entryEc;
+    if (!fs::is_symlink(entry.symlink_status(entryEc)) || entryEc) continue;
+
+    std::string name = entry.path().filename().string();
+    if (name == target.filename().string()) continue;
+
+    fs::path resolvedLink = fs::weakly_canonical(entry.path(), entryEc);
+    if (entryEc || resolvedLink != resolvedTarget) continue;
+
+    int rank = kDigitFreeRank;
+    for (size_t i = 0; i < std::size(kPreferred); ++i) {
+      if (name == kPreferred[i]) {
+        rank = static_cast<int>(i);
+        break;
+      }
+    }
+    if (rank == kDigitFreeRank &&
+        name.find_first_of("0123456789") != std::string::npos) {
+      continue;
+    }
+
+    if (rank < bestRank || (rank == bestRank && (bestName.empty() || name < bestName))) {
+      bestRank = rank;
+      bestName = name;
+    }
+  }
+
+  if (bestName.empty()) return path;
+  return (parent / bestName).string();
 }
 
 std::string GetConfigDir() {
@@ -97,7 +151,8 @@ std::string GetAppsDir(const std::string& configuredAppsDir) {
 std::string GetStableVersion() {
   const char* home = std::getenv("HOME");
   if (home) {
-    std::string vpath = std::string(home) + "/.local/opt/powerarm-stable/VERSION";
+    std::string vpath = std::string(home) + "/.local/opt/" +
+                        Backend::GetActiveBackend().stableOptDir + "/VERSION";
     std::ifstream f(vpath);
     if (f.is_open()) {
       std::string ver;
@@ -113,7 +168,8 @@ std::string GetStableVersion() {
 }
 
 std::string GetBinfmtStatus() {
-  std::ifstream f("/proc/sys/fs/binfmt_misc/POWERarm-aarch64");
+  const auto& backend = Backend::GetActiveBackend();
+  std::ifstream f("/proc/sys/fs/binfmt_misc/" + backend.binfmtName);
   if (f.is_open()) {
     std::string line;
     while (std::getline(f, line)) {
@@ -126,7 +182,7 @@ std::string GetBinfmtStatus() {
 
   std::ifstream general("/proc/sys/fs/binfmt_misc/status");
   if (general.is_open()) {
-    return "available (POWERarm not registered)";
+    return "available (" + backend.displayName + " not registered)";
   }
   return "binfmt_misc not mounted";
 }
@@ -148,8 +204,9 @@ std::string GetScriptDir() {
     return dataRootfs;
   }
 
-  if (fs::is_directory("/usr/share/powerarm/rootfs")) {
-    return "/usr/share/powerarm/rootfs";
+  std::string systemRootfs = "/usr/share/" + Backend::GetActiveBackend().dataSubdir + "/rootfs";
+  if (fs::is_directory(systemRootfs)) {
+    return systemRootfs;
   }
 
   return "";

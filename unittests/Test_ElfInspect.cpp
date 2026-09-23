@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <catch2/catch_test_macros.hpp>
 #include "ElfInspect.h"
+#include "Backend.h"
 #include <elf.h>
 #include <fstream>
 #include <filesystem>
@@ -106,5 +107,53 @@ TEST_CASE("ElfInspect: 64-byte Probe classification", "[sleeve][elf]") {
     REQUIRE(probe.appimage_offset == 1024 + 10 * 64);
   }
 
+  fs::remove_all(tmpDir);
+}
+
+TEST_CASE("ElfInspect: Position-independent executables count as target binaries", "[sleeve][elf]") {
+  // `sleeve add` used to require probe.has_interp, which the 64-byte probe never sets, so
+  // every PIE -- which is to say almost every modern binary -- was invisible to it while
+  // `sleeve scan` found it.
+  std::string tmpDir = "/tmp/sleeve_test_elf_pie";
+  fs::remove_all(tmpDir);
+  fs::create_directories(tmpDir);
+
+  auto write = [&](const std::string& name, uint16_t machine, uint16_t type) {
+    std::string path = tmpDir + "/" + name;
+    Elf64_Ehdr ehdr {};
+    ehdr.e_ident[EI_MAG0] = ELFMAG0;
+    ehdr.e_ident[EI_MAG1] = ELFMAG1;
+    ehdr.e_ident[EI_MAG2] = ELFMAG2;
+    ehdr.e_ident[EI_MAG3] = ELFMAG3;
+    ehdr.e_ident[EI_CLASS] = ELFCLASS64;
+    ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
+    ehdr.e_machine = machine;
+    ehdr.e_type = type;
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(&ehdr), sizeof(ehdr));
+    return path;
+  };
+
+  REQUIRE(Sleeve::Backend::SetActiveBackend("powerarm"));
+
+  auto pie = ProbeFile(write("pie", EM_AARCH64, ET_DYN));
+  CHECK(pie.kind == FileKind::AArch64_Dyn);
+  CHECK(pie.has_interp == false); // the probe does not read program headers
+  CHECK(IsTargetBinary(pie));
+
+  auto exec = ProbeFile(write("exec", EM_AARCH64, ET_EXEC));
+  CHECK(IsTargetBinary(exec));
+
+  auto foreign = ProbeFile(write("foreign", EM_X86_64, ET_DYN));
+  CHECK_FALSE(IsTargetBinary(foreign));
+
+  SECTION("and the x86 backend sees the mirror image") {
+    REQUIRE(Sleeve::Backend::SetActiveBackend("fastppcx86"));
+    CHECK(IsTargetBinary(ProbeFile(tmpDir + "/foreign")));
+    CHECK_FALSE(IsTargetBinary(ProbeFile(tmpDir + "/pie")));
+    REQUIRE(Sleeve::Backend::SetActiveBackend("powerarm"));
+  }
+
+  REQUIRE(Sleeve::Backend::SetActiveBackend("powerarm"));
   fs::remove_all(tmpDir);
 }

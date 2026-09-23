@@ -43,7 +43,8 @@ ProbeResult ProbeFile(const std::string& path);
 // Checks if a probed binary matches the active backend's target architecture
 bool IsTargetBinary(const ProbeResult& probe);
 
-// Detailed inspection for AArch64 binaries (reads PT_INTERP, DT_NEEDED)
-std::optional<ElfDetails> InspectAArch64(const std::string& path);
+// Detailed inspection for binaries of the active backend's guest architecture
+// (reads PT_INTERP, DT_NEEDED). The parse itself is plain ELF64.
+std::optional<ElfDetails> InspectTarget(const std::string& path);
 
 } // namespace Sleeve::ElfInspect

@@ -41,7 +41,12 @@ struct AppCandidate {
   bool desktop_enabled {true};
   std::string pacman_package;
   std::string rootfs_base;
+  // Where the scanner found this: a requested directory, or "overlay:<rootfs>".
+  std::string origin;
 };
+
+// Pulls the first dotted version number out of a path, "" when there is none.
+std::string ExtractVersionFromPath(const std::string& path);
 
 // Detect shape and details from a directory containing AArch64 executable(s)
 std::optional<AppCandidate> DetectDirectoryShape(const std::string& dirPath, const std::vector<std::string>& aarch64Binaries);

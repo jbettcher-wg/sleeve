@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <algorithm>
+#include <map>
 
 namespace fs = std::filesystem;
 using namespace Sleeve;
@@ -29,12 +30,12 @@ static void PrintHelp() {
   std::cout << "sleeve - emulated app manager (" << backend.displayName << ")\n\n"
             << "Usage:\n"
             << "  sleeve                               Launch terminal UI\n"
-            << "  sleeve scan [DIR...] [--json]        Scan directories for " << backend.archName << " apps\n"
+            << "  sleeve scan [DIR...] [--json]        Scan for " << backend.archName << " apps (with DIR: only there)\n"
             << "  sleeve add PATH [--name N] [--yes]   Add an app from directory or binary\n"
             << "  sleeve import PATH [--name N]        Import a foreign launcher into a managed record\n"
             << "  sleeve show NAME [--json]            Show app details\n"
             << "  sleeve list [--json]                 List managed apps\n"
-            << "  sleeve set NAME [OPTIONS...]         Configure app settings (rootfs=, cache=, fusion=, etc.)\n"
+            << "  sleeve set NAME [OPTIONS...]         Configure app settings (rootfs=, cache=, fusion=, startupnotify=, ...)\n"
             << "  sleeve wrap NAME [--dry-run] [--yes] Generate launcher, desktop, and AppConfig files\n"
             << "  sleeve check NAME [--version|--sec N] Run health check on app\n"
             << "  sleeve rootfs list [--json]          List discovered rootfses\n"
@@ -119,6 +120,7 @@ int main(int argc, char** argv) {
                   << "      \"title\": \"" << a.title << "\",\n"
                   << "      \"shape\": \"" << Shapes::ShapeToString(a.shape) << "\",\n"
                   << "      \"exe\": \"" << a.exe_path << "\",\n"
+                  << "      \"origin\": \"" << a.origin << "\",\n"
                   << "      \"version\": \"" << a.version << "\"\n"
                   << "    }" << (i + 1 < result.apps.size() ? "," : "") << "\n";
       }
@@ -140,11 +142,37 @@ int main(int argc, char** argv) {
                 << std::fixed << std::setprecision(1) << result.stats.elapsed_seconds << " s ("
                 << result.stats.files_probed << " files probed):\n\n";
 
+      // Group by where each row came from, so a row from the overlay is never read as a
+      // result of scanning the directory that was asked about.
+      std::vector<std::string> originOrder;
+      std::map<std::string, std::vector<const Shapes::AppCandidate*>> byOrigin;
       for (const auto& a : result.apps) {
-        std::cout << "  • " << std::left << std::setw(16) << a.name
-                  << std::setw(28) << a.title
-                  << std::setw(12) << Shapes::ShapeToString(a.shape)
-                  << Paths::ContractUser(a.exe_path) << "\n";
+        std::string origin = a.origin.empty() ? std::string("(unknown)") : a.origin;
+        if (!byOrigin.count(origin)) originOrder.push_back(origin);
+        byOrigin[origin].push_back(&a);
+      }
+
+      for (const auto& origin : originOrder) {
+        std::cout << "  " << Paths::ContractUser(origin) << ":\n";
+        for (const auto* a : byOrigin[origin]) {
+          std::cout << "    • " << std::left << std::setw(16) << a->name
+                    << std::setw(28) << a->title
+                    << std::setw(12) << Shapes::ShapeToString(a->shape)
+                    << Paths::ContractUser(a->exe_path) << "\n";
+        }
+      }
+
+      if (result.apps.empty()) {
+        std::cout << "  No " << Backend::GetActiveBackend().archName << " apps found under:\n";
+        for (const auto& d : result.searched_dirs) {
+          std::cout << "    " << Paths::ContractUser(d) << "\n";
+        }
+        if (result.explicit_dirs) {
+          std::cout << "  (only the directories you named were searched; run 'sleeve scan' with no\n"
+                    << "   arguments to also search the standard locations and the rootfs overlays)\n";
+        }
+      } else if (result.explicit_dirs) {
+        std::cout << "\n  Only the directories named on the command line were searched.\n";
       }
 
       if (!result.foreign_launchers.empty()) {
@@ -179,39 +207,65 @@ int main(int argc, char** argv) {
     }
 
     if (fs::is_directory(path)) {
+      // Use the same test the scanner uses. The old one required has_interp, which the
+      // 64-byte probe never sets, so every position-independent executable -- which is to
+      // say almost every modern binary -- was invisible to `add` while `scan` found it.
       std::vector<std::string> binaries;
-      for (const auto& entry : fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied)) {
-        if (entry.is_regular_file()) {
-          auto probe = ElfInspect::ProbeFile(entry.path().string());
-          if (probe.kind == ElfInspect::FileKind::AArch64_Exec ||
-              (probe.kind == ElfInspect::FileKind::AArch64_Dyn && probe.has_interp)) {
-            binaries.push_back(entry.path().string());
-          }
+      std::error_code walkEc;
+      for (const auto& entry : fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied, walkEc)) {
+        std::error_code ec;
+        if (!entry.is_regular_file(ec) || ec) continue;
+        auto probe = ElfInspect::ProbeFile(entry.path().string());
+        if (ElfInspect::IsTargetBinary(probe)) {
+          binaries.push_back(entry.path().string());
         }
+      }
+      // Prefer the stable alias over the version directory, as the scanner does.
+      std::string stablePath = Paths::PreferStableSymlinkPath(path);
+      if (stablePath != path) {
+        for (auto& b : binaries) {
+          if (b.rfind(path + "/", 0) == 0) b = stablePath + b.substr(path.size());
+        }
+        path = stablePath;
       }
       auto cand = Shapes::DetectDirectoryShape(path, binaries);
       if (cand) {
         if (!customName.empty()) cand->name = customName;
+        if (!Record::IsValidAppName(cand->name)) {
+          std::cerr << "Error: '" << cand->name << "' is not usable as an app name; pass --name\n";
+          return 1;
+        }
         auto rec = Record::CreateFromCandidate(*cand, defaultRootfs);
-        Record::SaveRecord(rec);
+        if (!Record::SaveRecord(rec)) {
+          std::cerr << "Error: could not write record for '" << rec.name << "'\n";
+          return 1;
+        }
         std::cout << "Added app '" << rec.name << "' (" << rec.title << ", shape: " << rec.shape << ")\n";
         return 0;
       }
     }
 
-    auto details = ElfInspect::InspectAArch64(path);
+    auto details = ElfInspect::InspectTarget(path);
     if (details) {
       auto cand = Shapes::DetectBinaryShape(path, *details);
       if (cand) {
         if (!customName.empty()) cand->name = customName;
+        if (!Record::IsValidAppName(cand->name)) {
+          std::cerr << "Error: '" << cand->name << "' is not usable as an app name; pass --name\n";
+          return 1;
+        }
         auto rec = Record::CreateFromCandidate(*cand, defaultRootfs);
-        Record::SaveRecord(rec);
+        if (!Record::SaveRecord(rec)) {
+          std::cerr << "Error: could not write record for '" << rec.name << "'\n";
+          return 1;
+        }
         std::cout << "Added binary app '" << rec.name << "' (shape: " << rec.shape << ")\n";
         return 0;
       }
     }
 
-    std::cerr << "Error: could not detect arm64 application at " << path << "\n";
+    std::cerr << "Error: could not detect a " << Backend::GetActiveBackend().archName
+              << " application at " << path << "\n";
     return 1;
   }
 
@@ -261,11 +315,11 @@ int main(int argc, char** argv) {
                 << "  Shape:     " << rec->shape << "\n"
                 << "  Exe:       " << rec->GetResolvedExePath() << "\n"
                 << "  RootFS:    " << (rec->rootfs.empty() ? "(none)" : rec->rootfs) << "\n"
-                << "  Args:      ";
-      for (const auto& a : rec->args) std::cout << a << " ";
-      std::cout << "\n  Desktop:   " << (rec->desktop.enabled ? "enabled" : "disabled") << "\n";
+                << "  Args:      " << Record::JoinArgsForEditing(rec->args) << "\n"
+                << "  Desktop:   " << (rec->desktop.enabled ? "enabled" : "disabled") << "\n";
       if (rec->desktop.enabled) {
-        std::cout << "  WMClass:   " << rec->desktop.wmclass << "\n";
+        std::cout << "  WMClass:   " << rec->desktop.wmclass << "\n"
+                  << "  StartupNotify: " << (rec->desktop.startup_notify ? "true" : "false") << "\n";
       }
       std::cout << "  AppConfig: ";
       for (const auto& [k, v] : rec->appconfig) {
@@ -293,6 +347,11 @@ int main(int argc, char** argv) {
                   << (i + 1 < records.size() ? "," : "") << "\n";
       }
       std::cout << "]\n";
+    } else if (records.empty()) {
+      const auto& backend = Backend::GetActiveBackend();
+      std::cout << "No apps managed under " << backend.displayName << ".\n"
+                << "Records live in " << Paths::ContractUser(Paths::GetRecordDir()) << "; "
+                << "run 'sleeve scan' to find apps to add.\n";
     } else {
       for (const auto& r : records) {
         std::cout << std::left << std::setw(16) << r.name
@@ -333,8 +392,16 @@ int main(int argc, char** argv) {
       std::string val = opt.substr(eq + 1);
 
       if (key == "rootfs") {
-        rec->rootfs = val;
-        std::cout << "Set rootfs = " << val << "\n";
+        auto resolved = RootFS::ResolveRootFSName(val);
+        if (!resolved.ok) {
+          std::cerr << "Error: " << resolved.error << "\n";
+          return 1;
+        }
+        rec->rootfs = resolved.path;
+        std::cout << "Set rootfs = " << rec->rootfs << "\n";
+      } else if (key == "startupnotify") {
+        rec->desktop.startup_notify = (val == "on" || val == "1" || val == "true");
+        std::cout << "Set startup_notify = " << (rec->desktop.startup_notify ? "true" : "false") << "\n";
       } else if (key == "cache") {
         rec->appconfig["EnableCodeCachingWIP"] = (val == "on" || val == "1" || val == "true") ? "1" : "0";
         std::cout << "Set EnableCodeCachingWIP = " << rec->appconfig["EnableCodeCachingWIP"] << "\n";
@@ -546,7 +613,14 @@ int main(int argc, char** argv) {
   // 9. ROOTFS
   if (cmd == "rootfs") {
     if (filteredArgs.size() >= 3 && filteredArgs[1] == "use") {
-      std::string targetRootfs = filteredArgs[2];
+      // A name that does not resolve does not fail loudly at run time: the emulator falls
+      // back to host binaries. Refuse it here instead.
+      auto resolved = RootFS::ResolveRootFSName(filteredArgs[2]);
+      if (!resolved.ok) {
+        std::cerr << "Error: " << resolved.error << "\n";
+        return 1;
+      }
+      std::string targetRootfs = resolved.path;
       std::string outDiff;
       bool ok = AppConfigWriter::SetUserConfigRootFS(targetRootfs, dryRun, &outDiff);
       if (dryRun || !assumeYes) {
@@ -569,6 +643,8 @@ int main(int argc, char** argv) {
                   << "      \"name\": \"" << r.name << "\",\n"
                   << "      \"base_path\": \"" << r.base_path << "\",\n"
                   << "      \"has_overlay\": " << (r.has_overlay ? "true" : "false") << ",\n"
+                  << "      \"elf_machine\": " << r.elf_machine << ",\n"
+                  << "      \"arch_verified\": " << (r.arch_verified ? "true" : "false") << ",\n"
                   << "      \"package_count\": " << r.package_count << "\n"
                   << "    }" << (i + 1 < rfs.rootfses.size() ? "," : "") << "\n";
       }
@@ -577,11 +653,16 @@ int main(int argc, char** argv) {
       std::cout << "Default RootFS (Config.json): " << (rfs.config_default_rootfs.empty() ? "(none)" : rfs.config_default_rootfs) << "\n";
       std::cout << "Shell RootFS (env):           " << (rfs.env_rootfs.empty() ? "(unset)" : rfs.env_rootfs) << "\n\n";
 
+      if (rfs.rootfses.empty()) {
+        std::cout << "No rootfs found for " << Backend::GetActiveBackend().displayName << " under "
+                  << Paths::ContractUser(Paths::GetDataDir() + "/RootFS") << ".\n";
+      }
       for (const auto& r : rfs.rootfses) {
         std::cout << "  " << (r.is_config_default ? "▶ " : "  ")
                   << std::left << std::setw(20) << r.name
                   << std::setw(12) << RootFS::FormatBytes(r.base_size_bytes)
-                  << (r.has_overlay ? "overlay: yes (" + std::to_string(r.package_count) + " pkgs)" : "overlay: none")
+                  << std::setw(28) << (r.has_overlay ? "overlay: yes (" + std::to_string(r.package_count) + " pkgs)" : "overlay: none")
+                  << (r.arch_verified ? "" : "arch unverified")
                   << "\n";
       }
     }

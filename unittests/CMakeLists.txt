@@ -9,6 +9,7 @@ add_executable(SleeveTests
   Test_AppConfigWriter.cpp
   Test_Health.cpp
   Test_Record.cpp
+  Test_Scanner.cpp
 )
 
 target_link_libraries(SleeveTests PRIVATE

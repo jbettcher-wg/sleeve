@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "App.h"
 #include "Paths.h"
+#include "Backend.h"
 #include "FileWriter.h"
 #include "Generate.h"
 
@@ -57,14 +58,8 @@ Component CreateMainScreen(AppState* state, ScreenInteractive* screen) {
   menu_opt.on_enter = [state, screen]() {
     if (state->selected_app_index >= 0 && state->selected_app_index < static_cast<int>(state->records.size())) {
       state->editing_record = state->records[state->selected_app_index];
-      state->edit_args_str.clear();
-      for (size_t i = 0; i < state->editing_record.args.size(); ++i) {
-        state->edit_args_str += (i > 0 ? " " : "") + state->editing_record.args[i];
-      }
-      state->edit_env_str.clear();
-      for (const auto& [k, v] : state->editing_record.env) {
-        state->edit_env_str += k + "=" + v + " ";
-      }
+      state->edit_args_str = Record::JoinArgsForEditing(state->editing_record.args);
+      state->edit_env_str = Record::JoinEnvForEditing(state->editing_record.env);
       state->current_tab = ScreenTab::Options;
       screen->PostEvent(Event::Custom);
     }
@@ -83,7 +78,7 @@ Component CreateMainScreen(AppState* state, ScreenInteractive* screen) {
     // Top status line
     auto header = hbox({
       text(" sleeve · ") | bold | color(accentCol),
-      text("POWERarm apps  ") | bold,
+      text(Backend::GetActiveBackend().displayName + " apps  ") | bold,
       filler(),
       text("stable: ") | color(Color::Palette16(8)),
       text(state->stable_version.empty() ? "dev" : state->stable_version) | bold,
@@ -99,7 +94,7 @@ Component CreateMainScreen(AppState* state, ScreenInteractive* screen) {
     if (state->records.empty()) {
       left_content = vbox({
         text("No apps configured yet.") | dim,
-        text("Press [s] to scan directories for arm64 programs.") | bold,
+        text("Press [s] to scan directories for " + Backend::GetActiveBackend().archName + " programs.") | bold,
       });
     } else {
       left_content = app_menu->Render() | vscroll_indicator | frame;
@@ -125,7 +120,7 @@ Component CreateMainScreen(AppState* state, ScreenInteractive* screen) {
                                       (desktopStatus.verdict == FileWriter::FileVerdict::HandEdited) ? "modified" : "foreign";
 
       right_content = vbox({
-        text(cur.title + " (arm64)") | bold | color(accentCol),
+        text(cur.title + " (" + Backend::GetActiveBackend().archName + ")") | bold | color(accentCol),
         separator(),
         hbox({ text("exe     ") | color(Color::Palette16(8)), text(Paths::ContractUser(cur.GetResolvedExePath())) | bold }),
         hbox({ text("rootfs  ") | color(Color::Palette16(8)), text(Paths::ContractUser(cur.rootfs)) }),

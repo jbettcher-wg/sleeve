@@ -19,7 +19,7 @@ Currently supporting:
    - **Pacman Overlay**: Applications installed into rootfs overlay via guest pacman.
    - **Runtime / CLI**: Single-binary tools and CLI utilities (launcher only, no desktop entry).
 2. **Safe Shell Wrappers**: Generates POSIX `sh` launchers in `~/.local/bin/<name>` avoiding raw ELF symlinks (preventing `O_TRUNC` -> `SIGBUS` issues).
-3. **Desktop Integration**: Generates `~/.local/share/applications/<name>-<arch>.desktop` with absolute icons, `StartupWMClass`, and `X-Sleeve-Managed` tags for Omarchy / Hyprland.
+3. **Desktop Integration**: Generates `~/.local/share/applications/<name>-<arch>.desktop` with absolute icons, `StartupWMClass`, `X-Sleeve-Managed` tags for Omarchy / Hyprland, and `StartupNotify=false` (no emulated app completes the startup handshake, so the launcher's spinner would never stop; re-enable per app with `sleeve set NAME startupnotify=on`).
 4. **Emulator AppConfig Management**: Merges managed keys (`RootFS`, `EnableCodeCachingWIP`, `CodeCacheScope`, `DisableCmpBranchFusion`, `ProfileStats`) into `~/.config/<emulator>/AppConfig/<program>.json`, strictly preserving all existing user overrides, `ThunksDB`, and custom sections.
 5. **Health Checks**: `sleeve check` runs the app (via `--version` or timed with window detection via `hyprctl clients -j`), analyzes logs, deduplicates unimplemented instruction probes, and diagnoses missing shared libraries or emulator faults.
 6. **Omarchy Theming**: Automatically detects the active Omarchy theme and palette via `omarchy-theme-color`. Watches `~/.local/state/omarchy/current/` via inotify to re-tint running TUI sessions dynamically upon theme switches.
@@ -33,7 +33,10 @@ Currently supporting:
 # Launch interactive terminal UI
 sleeve
 
-# Scan directories for guest applications
+# Scan for guest applications. With no arguments this searches the standard locations and
+# the rootfs overlays; with DIR arguments it searches only those. Every row says where it
+# came from, and a version directory is reported through its `current` symlink when one
+# points at it, so launchers survive app updates.
 sleeve scan [DIR...] [--json]
 
 # Add an application from a directory or binary
@@ -48,6 +51,7 @@ sleeve show code [--json]
 
 # Configure application knobs
 sleeve set factorio stats=on fusion=on cache=on scope=home
+sleeve set code startupnotify=off
 sleeve set code rootfs=/home/jbettcher/.local/share/powerarm/RootFS/ArchLinuxARM-vk
 
 # Generate / update launcher, desktop entry, and AppConfig (with preview diff)
@@ -57,7 +61,9 @@ sleeve wrap code [--dry-run] [--yes]
 sleeve check code --version
 sleeve check factorio --seconds 20
 
-# RootFS management
+# RootFS management. Discovery is scoped to the active backend and the guest architecture
+# is read from the tree itself, so an x86_64 rootfs is never offered to an AArch64 guest.
+# A name that does not resolve is refused rather than silently falling back to host binaries.
 sleeve rootfs list
 sleeve rootfs use ArchLinuxARM-m2
 

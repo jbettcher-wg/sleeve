@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Record.h"
 #include "Paths.h"
+#include "Backend.h"
 
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,110 @@ std::string AppRecord::GetResolvedIconPath() const {
   return desktop.icon;
 }
 
+static std::string QuoteForEditing(const std::string& value) {
+  bool needsQuotes = value.empty();
+  for (char c : value) {
+    if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '\\') {
+      needsQuotes = true;
+      break;
+    }
+  }
+  if (!needsQuotes) return value;
+
+  std::string out = "\"";
+  for (char c : value) {
+    if (c == '"' || c == '\\') out.push_back('\\');
+    out.push_back(c);
+  }
+  out.push_back('"');
+  return out;
+}
+
+static std::vector<std::string> SplitRespectingQuotes(const std::string& text) {
+  std::vector<std::string> words;
+  std::string current;
+  bool inWord = false;
+  char quote = '\0';
+
+  for (size_t i = 0; i < text.size(); ++i) {
+    char c = text[i];
+    if (c == '\\' && i + 1 < text.size() && quote != '\'') {
+      current.push_back(text[++i]);
+      inWord = true;
+      continue;
+    }
+    if (quote != '\0') {
+      if (c == quote) {
+        quote = '\0';
+      } else {
+        current.push_back(c);
+      }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      quote = c;
+      inWord = true;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\n') {
+      if (inWord) {
+        words.push_back(current);
+        current.clear();
+        inWord = false;
+      }
+      continue;
+    }
+    current.push_back(c);
+    inWord = true;
+  }
+  if (inWord) words.push_back(current);
+  return words;
+}
+
+std::string JoinArgsForEditing(const std::vector<std::string>& args) {
+  std::string out;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (i > 0) out += " ";
+    out += QuoteForEditing(args[i]);
+  }
+  return out;
+}
+
+std::vector<std::string> SplitArgsFromEditing(const std::string& text) {
+  return SplitRespectingQuotes(text);
+}
+
+std::string JoinEnvForEditing(const std::map<std::string, std::string>& env) {
+  std::string out;
+  for (const auto& [k, v] : env) {
+    if (!out.empty()) out += " ";
+    out += QuoteForEditing(k + "=" + v);
+  }
+  return out;
+}
+
+std::map<std::string, std::string> SplitEnvFromEditing(const std::string& text) {
+  std::map<std::string, std::string> env;
+  for (const auto& pair : SplitRespectingQuotes(text)) {
+    auto eq = pair.find('=');
+    if (eq == std::string::npos || eq == 0) continue;
+    env[pair.substr(0, eq)] = pair.substr(eq + 1);
+  }
+  return env;
+}
+
+bool IsValidAppName(const std::string& name) {
+  if (name.empty() || name.size() > 128) return false;
+  if (name == "." || name == "..") return false;
+  if (name.front() == '.' || name.front() == '-') return false;
+  for (char c : name) {
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-' || c == '+' || c == '@';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 AppRecord CreateFromCandidate(const Shapes::AppCandidate& cand, const std::string& defaultRootfs) {
   AppRecord rec;
   rec.format = 1;
@@ -47,11 +152,11 @@ AppRecord CreateFromCandidate(const Shapes::AppCandidate& cand, const std::strin
   } else if (cand.shape == Shapes::ShapeType::Electron ||
              cand.shape == Shapes::ShapeType::Gecko ||
              cand.shape == Shapes::ShapeType::Game) {
-    // Prefer rootfs with overlay (desktop packages)
-    const char* home = std::getenv("HOME");
-    std::string vkPath = (home ? std::string(home) : "") + "/.local/share/powerarm/RootFS/ArchLinuxARM-vk";
-    if (std::filesystem::exists(vkPath)) {
-      rec.rootfs = vkPath;
+    // Prefer the backend's desktop rootfs (the one carrying the overlay packages)
+    const auto& backend = Backend::GetActiveBackend();
+    std::string desktopPath = Paths::GetDataDir() + "/RootFS/" + backend.defaultRootfsDesktop;
+    if (std::filesystem::exists(desktopPath)) {
+      rec.rootfs = desktopPath;
     } else {
       rec.rootfs = defaultRootfs;
     }
@@ -66,9 +171,10 @@ AppRecord CreateFromCandidate(const Shapes::AppCandidate& cand, const std::strin
   rec.appconfig["ProfileStats"] = "0";
 
   // Desktop
+  const auto& backend = Backend::GetActiveBackend();
   rec.desktop.enabled = cand.desktop_enabled;
-  rec.desktop.name = cand.title + " (arm64)";
-  rec.desktop.comment = cand.title + " under POWERarm";
+  rec.desktop.name = cand.title + " (" + backend.archName + ")";
+  rec.desktop.comment = cand.title + " under " + backend.displayName;
   rec.desktop.wmclass = cand.wmclass;
   rec.desktop.categories = cand.categories;
   rec.desktop.mimetypes = cand.mimetypes;
@@ -200,7 +306,8 @@ std::string EmitJson(const AppRecord& r) {
   ss << "    \"icon\": \"" << EscapeString(r.desktop.icon) << "\",\n";
   ss << "    \"categories\": \"" << EscapeString(r.desktop.categories) << "\",\n";
   ss << "    \"mimetypes\": \"" << EscapeString(r.desktop.mimetypes) << "\",\n";
-  ss << "    \"exec_field\": \"" << EscapeString(r.desktop.exec_field) << "\"\n";
+  ss << "    \"exec_field\": \"" << EscapeString(r.desktop.exec_field) << "\",\n";
+  ss << "    \"startup_notify\": " << (r.desktop.startup_notify ? "true" : "false") << "\n";
   ss << "  },\n";
 
   // presets
@@ -270,6 +377,7 @@ static int GetIntProp(const json_t* obj, const char* name, int def = 0) {
 }
 
 std::optional<AppRecord> LoadRecord(const std::string& name) {
+  if (!IsValidAppName(name)) return std::nullopt;
   std::string path = Paths::GetRecordDir() + "/" + name + ".json";
   std::ifstream f(path);
   if (!f.is_open()) return std::nullopt;
@@ -362,6 +470,7 @@ std::optional<AppRecord> LoadRecord(const std::string& name) {
     r.desktop.categories = GetStringProp(dt, "categories", "");
     r.desktop.mimetypes = GetStringProp(dt, "mimetypes", "");
     r.desktop.exec_field = GetStringProp(dt, "exec_field", "%F");
+    r.desktop.startup_notify = GetBoolProp(dt, "startup_notify", false);
   }
 
   const json_t* ps = json_getProperty(root, "presets");
@@ -407,6 +516,7 @@ std::optional<AppRecord> LoadRecord(const std::string& name) {
 }
 
 bool SaveRecord(const AppRecord& record) {
+  if (!IsValidAppName(record.name)) return false;
   std::string dir = Paths::GetRecordDir();
   std::error_code ec;
   fs::create_directories(dir, ec);
@@ -450,6 +560,7 @@ std::vector<AppRecord> ListRecords() {
 }
 
 bool DeleteRecord(const std::string& name) {
+  if (!IsValidAppName(name)) return false;
   std::string path = Paths::GetRecordDir() + "/" + name + ".json";
   std::error_code ec;
   return fs::remove(path, ec);

@@ -26,6 +26,7 @@ static bool IsPruned(const std::string& name, const std::set<std::string>& prune
 
 static void ScanDirectoryRecursive(const std::string& rootDir, const ScanOptions& options,
                                    std::map<std::string, std::vector<std::string>>& dirToAArch64Binaries,
+                                   std::map<std::string, std::string>& binaryToOrigin,
                                    std::vector<std::pair<std::string, ElfInspect::ElfDetails>>& loneBinaries,
                                    ScanStats& stats) {
   std::error_code ec;
@@ -86,7 +87,7 @@ static void ScanDirectoryRecursive(const std::string& rootDir, const ScanOptions
 
     auto probe = ElfInspect::ProbeFile(pathStr);
     if (ElfInspect::IsTargetBinary(probe)) {
-      auto details = ElfInspect::InspectAArch64(pathStr);
+      auto details = ElfInspect::InspectTarget(pathStr);
       ElfInspect::ElfDetails det;
       if (details) {
         det = *details;
@@ -96,6 +97,7 @@ static void ScanDirectoryRecursive(const std::string& rootDir, const ScanOptions
       }
       std::string parentDir = entry.path().parent_path().string();
       dirToAArch64Binaries[parentDir].push_back(pathStr);
+      binaryToOrigin[pathStr] = rootDir;
       loneBinaries.push_back({pathStr, det});
     } else {
       switch (probe.kind) {
@@ -113,6 +115,49 @@ static void ScanDirectoryRecursive(const std::string& rootDir, const ScanOptions
 
     iter.increment(ec);
   }
+}
+
+std::string OverlayOrigin(const std::string& overlayName) {
+  return "overlay:" + overlayName;
+}
+
+size_t DedupeByResolvedTarget(std::vector<Shapes::AppCandidate>& apps) {
+  // How well a candidate's name describes the binary it points at. Two packages claiming
+  // one executable is not a tie to break at random: `pinentry` describes `pinentry-qt`,
+  // `gnupg` does not.
+  auto nameRank = [](const Shapes::AppCandidate& a) {
+    std::string exeName = fs::path(a.exe_path).filename().string();
+    if (a.name.empty()) return 4;
+    if (exeName == a.name) return 0;
+    if (exeName.rfind(a.name, 0) == 0) return 1;
+    if (exeName.find(a.name) != std::string::npos) return 2;
+    return 3;
+  };
+
+  std::map<std::string, size_t> byTarget; // resolved exe -> index into kept
+  std::vector<Shapes::AppCandidate> kept;
+  size_t dropped = 0;
+
+  for (const auto& app : apps) {
+    std::error_code ec;
+    std::string resolved = fs::weakly_canonical(fs::path(app.exe_path), ec).string();
+    if (ec || resolved.empty()) resolved = app.exe_path;
+
+    auto it = byTarget.find(resolved);
+    if (it == byTarget.end()) {
+      byTarget[resolved] = kept.size();
+      kept.push_back(app);
+      continue;
+    }
+
+    dropped++;
+    if (nameRank(app) < nameRank(kept[it->second])) {
+      kept[it->second] = app;
+    }
+  }
+
+  apps.swap(kept);
+  return dropped;
 }
 
 static void ScanOverlays(const ScanOptions& options, std::vector<Shapes::AppCandidate>& apps, ScanStats& stats) {
@@ -136,6 +181,7 @@ static void ScanOverlays(const ScanOptions& options, std::vector<Shapes::AppCand
             auto cand = Shapes::DetectPacmanPackage(entry.path().string(), descPath);
             if (cand) {
               cand->rootfs_base = rootfsDir + "/" + baseName;
+              cand->origin = OverlayOrigin(baseName);
               apps.push_back(*cand);
             }
           }
@@ -219,6 +265,9 @@ ScanResult RunScan(const ScanOptions& options) {
   auto startTime = std::chrono::steady_clock::now();
 
   ScanOptions opts = options;
+  // A caller who names directories asked about those directories. Folding the standard
+  // locations into that answer presents rows from somewhere else as the result.
+  result.explicit_dirs = !opts.search_dirs.empty();
   if (opts.search_dirs.empty()) {
     const char* home = std::getenv("HOME");
     if (home) {
@@ -240,15 +289,19 @@ ScanResult RunScan(const ScanOptions& options) {
   }
 
   std::map<std::string, std::vector<std::string>> dirToBinaries;
+  std::map<std::string, std::string> binaryToOrigin;
   std::vector<std::pair<std::string, ElfInspect::ElfDetails>> loneBinaries;
 
   for (const auto& d : opts.search_dirs) {
-    ScanDirectoryRecursive(Paths::ExpandUser(d), opts, dirToBinaries, loneBinaries, result.stats);
+    std::string expanded = Paths::ExpandUser(d);
+    result.searched_dirs.push_back(expanded);
+    ScanDirectoryRecursive(expanded, opts, dirToBinaries, binaryToOrigin, loneBinaries, result.stats);
   }
 
   // Collapse subdirectories into application root directories
   // E.g., ~/Development/vscode-arm64/1.138.0/bin and ~/Development/vscode-arm64/1.138.0
   std::map<std::string, std::vector<std::string>> appDirs;
+  std::map<std::string, std::string> appRootVersionedPath;
   for (const auto& [dir, bins] : dirToBinaries) {
     std::string appRoot = dir;
     // Check if dir ends in /bin or /bin/arm64 or /bin/x64
@@ -259,9 +312,24 @@ ScanResult RunScan(const ScanOptions& options) {
     } else if (fs::path(dir).parent_path().filename() == "Steam" || fs::path(dir).parent_path().parent_path().filename() == "Steam") {
       appRoot = Paths::ExpandUser("~/.local/share/Steam");
     }
+
+    // The walk never follows symlinks, so it always lands on the versioned directory.
+    // Report the stable alias when one points at it: the version directory is renamed on
+    // every update, and a launcher pinned to it breaks silently.
+    std::string versionedRoot = appRoot;
+    std::string stableRoot = Paths::PreferStableSymlinkPath(appRoot);
+
     for (const auto& b : bins) {
-      appDirs[appRoot].push_back(b);
+      std::string binPath = b;
+      if (stableRoot != versionedRoot && binPath.rfind(versionedRoot + "/", 0) == 0) {
+        binPath = stableRoot + binPath.substr(versionedRoot.size());
+      }
+      appDirs[stableRoot].push_back(binPath);
+      if (binaryToOrigin.count(b)) {
+        binaryToOrigin[binPath] = binaryToOrigin[b];
+      }
     }
+    appRootVersionedPath[stableRoot] = versionedRoot;
   }
 
   std::set<std::string> detectedExes;
@@ -269,6 +337,14 @@ ScanResult RunScan(const ScanOptions& options) {
   for (const auto& [appRoot, bins] : appDirs) {
     auto cand = Shapes::DetectDirectoryShape(appRoot, bins);
     if (cand) {
+      if (cand->version.empty() && appRootVersionedPath.count(appRoot)) {
+        cand->version = Shapes::ExtractVersionFromPath(appRootVersionedPath.at(appRoot));
+      }
+      if (binaryToOrigin.count(cand->exe_path)) {
+        cand->origin = binaryToOrigin.at(cand->exe_path);
+      } else if (!bins.empty() && binaryToOrigin.count(bins.front())) {
+        cand->origin = binaryToOrigin.at(bins.front());
+      }
       result.apps.push_back(*cand);
       detectedExes.insert(cand->exe_path);
     }
@@ -279,19 +355,25 @@ ScanResult RunScan(const ScanOptions& options) {
     if (!detectedExes.count(binPath)) {
       auto cand = Shapes::DetectBinaryShape(binPath, details);
       if (cand && cand->shape == Shapes::ShapeType::Runtime) {
+        if (binaryToOrigin.count(binPath)) {
+          cand->origin = binaryToOrigin.at(binPath);
+        }
         result.apps.push_back(*cand);
         detectedExes.insert(binPath);
       }
     }
   }
 
-  if (opts.scan_overlays) {
+  if (opts.scan_overlays && !result.explicit_dirs) {
     ScanOverlays(opts, result.apps, result.stats);
   }
 
-  if (opts.scan_bin_dir) {
+  if (opts.scan_bin_dir && !result.explicit_dirs) {
     ScanBinDirectory(result.foreign_launchers);
   }
+
+  // One binary is one app, however many places named it.
+  result.stats.duplicates_collapsed = DedupeByResolvedTarget(result.apps);
 
   auto endTime = std::chrono::steady_clock::now();
   result.stats.elapsed_seconds = std::chrono::duration<double>(endTime - startTime).count();

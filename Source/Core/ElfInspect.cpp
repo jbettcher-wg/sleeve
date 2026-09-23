@@ -94,9 +94,9 @@ ProbeResult ProbeFile(const std::string& path) {
   return res;
 }
 
-std::optional<ElfDetails> InspectAArch64(const std::string& path) {
+std::optional<ElfDetails> InspectTarget(const std::string& path) {
   ProbeResult probe = ProbeFile(path);
-  if (probe.kind != FileKind::AArch64_Exec && probe.kind != FileKind::AArch64_Dyn) {
+  if (!IsTargetBinary(probe)) {
     return std::nullopt;
   }
 

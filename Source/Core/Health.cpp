@@ -3,6 +3,7 @@
 #include "Paths.h"
 #include "Process.h"
 #include "FileWriter.h"
+#include "Backend.h"
 
 #include <sstream>
 #include <fstream>
@@ -94,7 +95,8 @@ CheckResult ClassifyRun(int exit_code, bool timed_out, double elapsed_seconds,
   else if (combined.find("Couldn't connect to POWERarmServer socket") != std::string::npos ||
            combined.find("Couldn't connect to FEXServer socket") != std::string::npos) {
     res.status = "server_socket_error";
-    res.summary = "The emulator server could not start; with a user namespace or a build path, set POWERARM_PORTABLE=1 (README line 274-275).";
+    res.summary = "The emulator server could not start; with a user namespace or a build path, set " +
+                  Backend::GetActiveBackend().envPrefix + "PORTABLE=1 (README line 274-275).";
   }
   // 5. Signals
   else if (exit_code == 132) {
@@ -185,8 +187,11 @@ CheckResult RunCheck(Record::AppRecord& record, const CheckOptions& options) {
   procOpt.args = cmd;
   procOpt.timeout_seconds = (options.mode == CheckMode::Timed) ? options.timeout_seconds : 120.0;
   procOpt.env = record.env;
-  procOpt.env["POWERARM_SILENTLOG"] = "0";
-  procOpt.env["POWERARM_OUTPUTLOG"] = "stderr";
+  // The log knobs belong to whichever emulator is active; under fastppcx86 the POWERarm
+  // names are ignored and the run produces nothing to classify.
+  const auto& backend = Backend::GetActiveBackend();
+  procOpt.env[backend.envPrefix + "SILENTLOG"] = "0";
+  procOpt.env[backend.envPrefix + "OUTPUTLOG"] = "stderr";
 
   // Check window presence if timed and Hyprland
   bool windowSeen = false;

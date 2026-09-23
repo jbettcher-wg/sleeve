@@ -15,12 +15,77 @@ namespace Sleeve::Generate {
 
 namespace fs = std::filesystem;
 
-static std::string ShellEscapePath(const std::string& path) {
+// Escapes the characters that end a double-quoted sh word. `$` is deliberately left
+// alone: records store paths and arguments that are meant to expand ($HOME), and the
+// generator's whole job is to put them inside quotes so the expansion cannot word-split.
+static std::string EscapeForDoubleQuotes(const std::string& value) {
+  std::string out;
+  out.reserve(value.size() + 8);
+  for (char c : value) {
+    if (c == '"' || c == '\\' || c == '`') {
+      out.push_back('\\');
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+// The body of a double-quoted word for a path: ~/x becomes $HOME/x so the launcher stays
+// portable between machines. Callers put the quotes on (directly, or around a larger word).
+static std::string ShellPathBody(const std::string& path) {
   std::string p = Paths::ContractUser(path);
   if (p.rfind("~/", 0) == 0) {
-    return "$HOME" + p.substr(1);
+    return "$HOME" + EscapeForDoubleQuotes(p.substr(1));
   }
-  return p;
+  return EscapeForDoubleQuotes(p);
+}
+
+// A complete, quoted sh word for a path.
+static std::string ShellQuotePath(const std::string& path) {
+  return "\"" + ShellPathBody(path) + "\"";
+}
+
+// A complete sh word for a record argument. Left bare when every character is inert,
+// quoted otherwise -- including whenever the argument expands something, because the
+// expansion is what would word-split on a path with a space in it.
+static std::string ShellQuoteArg(const std::string& arg) {
+  // Records written by older versions carry their own quotes; strip one wrapping pair
+  // so the app does not receive literal quote characters in argv.
+  std::string value = arg;
+  if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+    value = value.substr(1, value.size() - 2);
+  }
+
+  if (value.empty()) return "\"\"";
+
+  bool inert = true;
+  for (char c : value) {
+    bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == ',' ||
+                c == '=' || c == '+' || c == '@' || c == '%';
+    if (!safe) {
+      inert = false;
+      break;
+    }
+  }
+  if (inert) return value;
+
+  return "\"" + EscapeForDoubleQuotes(value) + "\"";
+}
+
+// Desktop entry Exec= is a command line, not a path: a program path containing a space
+// has to be quoted there too, or the launcher splits it into program plus argument.
+static std::string DesktopExecQuote(const std::string& path) {
+  if (path.find_first_of(" \t\"\\'><~|&;$*?#()`") == std::string::npos) {
+    return path;
+  }
+  std::string out = "\"";
+  for (char c : path) {
+    if (c == '"' || c == '\\' || c == '`' || c == '$') out.push_back('\\');
+    out.push_back(c);
+  }
+  out.push_back('"');
+  return out;
 }
 
 GeneratedOutputs GenerateFiles(const Record::AppRecord& r) {
@@ -39,7 +104,7 @@ GeneratedOutputs GenerateFiles(const Record::AppRecord& r) {
   ss << "# " << r.title << " (" << backend.archName << ") under " << backend.displayName << ". Regenerate with: sleeve wrap " << r.name << "\n";
 
   if (!r.rootfs.empty()) {
-    ss << "export " << backend.envPrefix << "ROOTFS=\"${" << backend.envPrefix << "ROOTFS:-" << ShellEscapePath(r.rootfs) << "}\"\n";
+    ss << "export " << backend.envPrefix << "ROOTFS=\"${" << backend.envPrefix << "ROOTFS:-" << ShellPathBody(r.rootfs) << "}\"\n";
   }
 
   if (r.emulator.has_value() && !r.emulator->empty()) {
@@ -49,30 +114,30 @@ GeneratedOutputs GenerateFiles(const Record::AppRecord& r) {
   if (r.mangohud.enabled) {
     ss << "export MANGOHUD=1\n";
     ss << "export LD_PRELOAD='/usr/$LIB/mangohud/libMangoHud_shim.so'\n";
-    ss << "export MANGOHUD_CONFIG=\"${MANGOHUD_CONFIG:-" << r.mangohud.config << "}\"\n";
-    ss << "export POWERARM_PROFILESTATS=1\n";
+    ss << "export MANGOHUD_CONFIG=\"${MANGOHUD_CONFIG:-" << EscapeForDoubleQuotes(r.mangohud.config) << "}\"\n";
+    ss << "export " << backend.envPrefix << "PROFILESTATS=1\n";
   }
 
   for (const auto& [k, v] : r.env) {
-    ss << "export " << k << "=\"${" << k << ":-" << v << "}\"\n";
+    ss << "export " << k << "=\"${" << k << ":-" << EscapeForDoubleQuotes(v) << "}\"\n";
   }
 
   std::string exePath = r.GetResolvedExePath();
-  std::string exeEscaped = ShellEscapePath(exePath);
+  std::string exeQuoted = ShellQuotePath(exePath);
 
   if (r.cwd == "install" && !r.source.dir.empty()) {
-    ss << "cd \"" << ShellEscapePath(r.source.dir) << "\" && ";
+    ss << "cd " << ShellQuotePath(r.source.dir) << " && ";
   }
 
   ss << "exec ";
   if (r.emulator.has_value() && !r.emulator->empty()) {
-    ss << "\"" << ShellEscapePath(*r.emulator) << "\" \"" << exeEscaped << "\"";
+    ss << ShellQuotePath(*r.emulator) << " " << exeQuoted;
   } else {
-    ss << "\"" << exeEscaped << "\"";
+    ss << exeQuoted;
   }
 
   for (const auto& arg : r.args) {
-    ss << " " << arg;
+    ss << " " << ShellQuoteArg(arg);
   }
   ss << " \"$@\"\n";
 
@@ -85,9 +150,13 @@ GeneratedOutputs GenerateFiles(const Record::AppRecord& r) {
     std::ostringstream dss;
     dss << "[Desktop Entry]\n";
     dss << "Type=Application\n";
+    // No shape here can finish a startup notification: the launcher hands off to a wrapper
+    // script, then to the emulator, and the guest toolkit's window app_id does not match
+    // StartupWMClass -- so the desktop's launch indicator would spin until it timed out.
+    dss << "StartupNotify=" << (r.desktop.startup_notify ? "true" : "false") << "\n";
     dss << "Name=" << (r.desktop.name.empty() ? r.title + " (" + backend.archName + ")" : r.desktop.name) << "\n";
     dss << "Comment=" << (r.desktop.comment.empty() ? r.title + " under " + backend.displayName : r.desktop.comment) << "\n";
-    dss << "Exec=" << out.launcher_path << " " << (r.desktop.exec_field.empty() ? "%F" : r.desktop.exec_field) << "\n";
+    dss << "Exec=" << DesktopExecQuote(out.launcher_path) << " " << (r.desktop.exec_field.empty() ? "%F" : r.desktop.exec_field) << "\n";
 
     std::string iconPath = r.GetResolvedIconPath();
     if (!iconPath.empty()) {
@@ -133,6 +202,10 @@ std::optional<Record::AppRecord> ImportForeignLauncher(const std::string& launch
     name = fs::path(launcherPath).filename().string();
   }
 
+  const auto& backend = Backend::GetActiveBackend();
+  const std::string rootfsVar = backend.envPrefix + "ROOTFS";
+  const std::string rootfsExport = "export " + rootfsVar + "=";
+
   std::string line;
   std::string rootfs;
   std::map<std::string, std::string> env;
@@ -143,10 +216,11 @@ std::optional<Record::AppRecord> ImportForeignLauncher(const std::string& launch
     while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
     if (line.empty() || line[0] == '#') continue;
 
-    if (line.rfind("export POWERARM_ROOTFS=", 0) == 0) {
-      std::string val = line.substr(23);
-      if (val.rfind("\"${POWERARM_ROOTFS:-", 0) == 0) {
-        val = val.substr(20);
+    if (line.rfind(rootfsExport, 0) == 0) {
+      std::string val = line.substr(rootfsExport.size());
+      std::string indirect = "\"${" + rootfsVar + ":-";
+      if (val.rfind(indirect, 0) == 0) {
+        val = val.substr(indirect.size());
         if (val.size() >= 2 && val.substr(val.size() - 2) == "}\"") {
           val = val.substr(0, val.size() - 2);
         }
@@ -168,7 +242,8 @@ std::optional<Record::AppRecord> ImportForeignLauncher(const std::string& launch
         } else if (v.size() >= 2 && v.front() == '"' && v.back() == '"') {
           v = v.substr(1, v.size() - 2);
         }
-        if (k != "POWERARM_PORTABLE" && k != "MANGOHUD" && k != "LD_PRELOAD" && k != "POWERARM_PROFILESTATS") {
+        if (k != backend.envPrefix + "PORTABLE" && k != "MANGOHUD" && k != "LD_PRELOAD" &&
+            k != backend.envPrefix + "PROFILESTATS") {
           env[k] = v;
         }
       }
@@ -216,12 +291,14 @@ std::optional<Record::AppRecord> ImportForeignLauncher(const std::string& launch
 
   if (targetExe.empty()) return std::nullopt;
 
-  // If targetExe references $POWERARM_ROOTFS
+  // If targetExe references the backend's ROOTFS variable
   if (!rootfs.empty()) {
-    if (targetExe.rfind("${POWERARM_ROOTFS}", 0) == 0) {
-      targetExe = rootfs + targetExe.substr(18);
-    } else if (targetExe.rfind("$POWERARM_ROOTFS", 0) == 0) {
-      targetExe = rootfs + targetExe.substr(16);
+    std::string braced = "${" + rootfsVar + "}";
+    std::string bare = "$" + rootfsVar;
+    if (targetExe.rfind(braced, 0) == 0) {
+      targetExe = rootfs + targetExe.substr(braced.size());
+    } else if (targetExe.rfind(bare, 0) == 0) {
+      targetExe = rootfs + targetExe.substr(bare.size());
     }
   }
 
@@ -233,20 +310,20 @@ std::optional<Record::AppRecord> ImportForeignLauncher(const std::string& launch
   std::string elfProbeTarget = targetExe;
   auto probe = ElfInspect::ProbeFile(elfProbeTarget);
 
-  if (probe.kind != ElfInspect::FileKind::AArch64_Exec && probe.kind != ElfInspect::FileKind::AArch64_Dyn) {
+  if (!ElfInspect::IsTargetBinary(probe)) {
     // Check if it's in a /bin/ directory and an ELF exists in parent
     fs::path p(targetExe);
     if (p.parent_path().filename() == "bin") {
       std::string siblingElf = (p.parent_path().parent_path() / p.filename()).string();
       auto siblingProbe = ElfInspect::ProbeFile(siblingElf);
-      if (siblingProbe.kind == ElfInspect::FileKind::AArch64_Exec || siblingProbe.kind == ElfInspect::FileKind::AArch64_Dyn) {
+      if (ElfInspect::IsTargetBinary(siblingProbe)) {
         elfProbeTarget = siblingElf;
         probe = siblingProbe;
       }
     }
   }
 
-  if (probe.kind != ElfInspect::FileKind::AArch64_Exec && probe.kind != ElfInspect::FileKind::AArch64_Dyn) {
+  if (!ElfInspect::IsTargetBinary(probe)) {
     return std::nullopt;
   }
 
@@ -259,7 +336,7 @@ std::optional<Record::AppRecord> ImportForeignLauncher(const std::string& launch
 
   auto cand = Shapes::DetectDirectoryShape(parentDir, {elfProbeTarget});
   if (!cand) {
-    auto details = ElfInspect::InspectAArch64(elfProbeTarget);
+    auto details = ElfInspect::InspectTarget(elfProbeTarget);
     if (details) {
       cand = Shapes::DetectBinaryShape(elfProbeTarget, *details);
     }

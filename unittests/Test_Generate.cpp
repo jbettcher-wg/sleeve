@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "Generate.h"
 #include "Record.h"
+#include "TestEnv.h"
 #include <filesystem>
 #include <fstream>
 
@@ -40,4 +41,105 @@ TEST_CASE("Generate: Golden launcher and desktop entry", "[sleeve][generate]") {
   CHECK(out.desktop_content.find("Name=Visual Studio Code (arm64)") != std::string::npos);
   CHECK(out.desktop_content.find("StartupWMClass=Code") != std::string::npos);
   CHECK(out.desktop_content.find("X-Sleeve-Managed=true") != std::string::npos);
+}
+
+TEST_CASE("Generate: Desktop entry turns startup notification off", "[sleeve][generate]") {
+  // Omarchy's launch indicator spins until the startup notification completes. Nothing in
+  // this stack ever completes it: the desktop entry points at a wrapper script, which
+  // execs the emulator, and the guest window's app_id does not match StartupWMClass.
+  SleeveTest::ScopedTestHome home("generate-startup-notify");
+
+  Record::AppRecord r;
+  r.name = "code";
+  r.title = "Code";
+  r.shape = "electron";
+  r.exe = "/opt/code/bin/code";
+  r.desktop.enabled = true;
+  r.desktop.wmclass = "Code";
+
+  auto out = Generate::GenerateFiles(r);
+  REQUIRE(out.has_desktop);
+  CHECK(out.desktop_content.find("StartupNotify=false\n") != std::string::npos);
+  // Directly after Type=, where a hand-edited entry puts it.
+  CHECK(out.desktop_content.find("Type=Application\nStartupNotify=false\n") != std::string::npos);
+
+  SECTION("a record may opt back in") {
+    r.desktop.startup_notify = true;
+    auto opted = Generate::GenerateFiles(r);
+    CHECK(opted.desktop_content.find("StartupNotify=true\n") != std::string::npos);
+    CHECK(opted.desktop_content.find("StartupNotify=false") == std::string::npos);
+  }
+}
+
+TEST_CASE("Generate: Launcher arguments are quoted", "[sleeve][generate]") {
+  SleeveTest::ScopedTestHome home("generate-arg-quoting");
+
+  Record::AppRecord r;
+  r.name = "firefox";
+  r.title = "Firefox";
+  r.shape = "gecko";
+  r.exe = "/opt/firefox/firefox";
+  r.desktop.enabled = false;
+  r.args = {"--profile", "$HOME/.mozilla/firefox-arm64", "--no-remote"};
+
+  auto out = Generate::GenerateFiles(r);
+
+  // An expansion has to be quoted: $HOME can hold a space, and one of the managed apps
+  // already lives in "~/Antigravity IDE".
+  CHECK(out.launcher_content.find("--profile \"$HOME/.mozilla/firefox-arm64\"") != std::string::npos);
+  CHECK(out.launcher_content.find("--profile $HOME") == std::string::npos);
+  // Inert flags stay bare so regenerating does not churn every launcher.
+  CHECK(out.launcher_content.find(" --no-remote ") != std::string::npos);
+
+  SECTION("an argument with a space is quoted") {
+    r.args = {"--user-data-dir=/home/x/My Apps/data"};
+    auto spaced = Generate::GenerateFiles(r);
+    CHECK(spaced.launcher_content.find("\"--user-data-dir=/home/x/My Apps/data\"") != std::string::npos);
+  }
+
+  SECTION("an argument that already carries quotes is not quoted twice") {
+    r.args = {"--profile", "\"$HOME/.mozilla/firefox-arm64\""};
+    auto legacy = Generate::GenerateFiles(r);
+    CHECK(legacy.launcher_content.find("--profile \"$HOME/.mozilla/firefox-arm64\"") != std::string::npos);
+    CHECK(legacy.launcher_content.find("\\\"") == std::string::npos);
+  }
+
+  SECTION("a quote inside an argument cannot end the word") {
+    r.args = {"--title=say \"hi\""};
+    auto quoted = Generate::GenerateFiles(r);
+    CHECK(quoted.launcher_content.find("\"--title=say \\\"hi\\\"\"") != std::string::npos);
+  }
+}
+
+TEST_CASE("Generate: Paths with spaces survive the launcher and the desktop entry", "[sleeve][generate]") {
+  SleeveTest::ScopedTestHome home("generate-space-paths");
+
+  Record::AppRecord r;
+  r.name = "antigravity-ide";
+  r.title = "Antigravity IDE";
+  r.shape = "electron";
+  r.source.kind = "dir";
+  r.source.dir = home.Path("Antigravity IDE");
+  r.exe = "bin/antigravity-ide";
+  r.cwd = "install";
+  r.rootfs = home.Path("root fs/ArchLinuxARM-vk");
+  r.env["SOME_PATH"] = "$HOME/Antigravity IDE/data";
+  r.desktop.enabled = true;
+
+  auto out = Generate::GenerateFiles(r);
+
+  CHECK(out.launcher_content.find("cd \"$HOME/Antigravity IDE\" && ") != std::string::npos);
+  CHECK(out.launcher_content.find("exec \"$HOME/Antigravity IDE/bin/antigravity-ide\"") != std::string::npos);
+  CHECK(out.launcher_content.find("${POWERARM_ROOTFS:-$HOME/root fs/ArchLinuxARM-vk}") != std::string::npos);
+  CHECK(out.launcher_content.find("export SOME_PATH=\"${SOME_PATH:-$HOME/Antigravity IDE/data}\"") != std::string::npos);
+
+  REQUIRE(out.has_desktop);
+  SECTION("Exec= quotes a program path that contains a space") {
+    Record::AppRecord spaced = r;
+    spaced.name = "my app";
+    auto spacedOut = Generate::GenerateFiles(spaced);
+    REQUIRE(spacedOut.has_desktop);
+    CHECK(spacedOut.desktop_content.find("Exec=\"") != std::string::npos);
+    CHECK(spacedOut.desktop_content.find("/my app\" %F") != std::string::npos);
+  }
 }

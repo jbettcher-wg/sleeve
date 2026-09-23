@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Shapes.h"
 #include "Paths.h"
+#include "Backend.h"
 
 #include <filesystem>
 #include <fstream>
@@ -80,7 +81,7 @@ static std::string ExtractIniValue(const std::string& content, const std::string
   return "";
 }
 
-static std::string ExtractVersionFromPath(const std::string& path) {
+std::string ExtractVersionFromPath(const std::string& path) {
   std::regex verRe(R"((\d+\.\d+(\.\d+)*))");
   std::smatch m;
   if (std::regex_search(path, m, verRe)) {
@@ -94,6 +95,7 @@ std::optional<AppCandidate> DetectDirectoryShape(const std::string& dirPath, con
     return std::nullopt;
   }
 
+  const auto& backend = Backend::GetActiveBackend();
   AppCandidate cand;
   cand.dir = dirPath;
   cand.version = ExtractVersionFromPath(dirPath);
@@ -249,7 +251,9 @@ std::optional<AppCandidate> DetectDirectoryShape(const std::string& dirPath, con
       cand.wmclass = "firefox";
     }
 
-    cand.default_args = {"--profile", "\"$HOME/.mozilla/" + cand.name + "-arm64\""};
+    // Store the raw word. Quoting is the generator's job -- an argument that carries its
+    // own quotes either reaches argv with them attached or gets quoted twice.
+    cand.default_args = {"--profile", "$HOME/.mozilla/" + cand.name + "-" + std::string(backend.archName)};
 
     // Pick main executable
     for (const auto& b : aarch64Binaries) {
@@ -385,22 +389,58 @@ std::optional<AppCandidate> DetectPacmanPackage(const std::string& overlayRoot, 
 
   if (pkgName.empty()) return std::nullopt;
 
-  // Look for desktop file shipped by package in overlay
+  // Which .desktop file this package ships is not a guess: pacman records every path the
+  // package owns next to the desc. Matching on the file name instead made `gnupg` claim
+  // `org.gnupg.pinentry-qt.desktop`, which pinentry owns, and produced two records for one
+  // binary.
   std::string appDir = overlayRoot + "/usr/share/applications";
-  if (!fs::exists(appDir)) return std::nullopt;
+  std::error_code ec;
+  if (!fs::exists(appDir, ec)) return std::nullopt;
 
-  std::string foundDesktop;
-  for (const auto& entry : fs::directory_iterator(appDir)) {
-    if (entry.path().extension() == ".desktop") {
+  std::vector<std::string> ownedDesktops;
+  std::string filesPath = fs::path(pkgDescPath).parent_path().string() + "/files";
+  bool haveFileList = fs::exists(filesPath, ec);
+  if (haveFileList) {
+    std::string files = ReadFile(filesPath);
+    std::istringstream fstream(files);
+    std::string fline;
+    while (std::getline(fstream, fline)) {
+      while (!fline.empty() && (fline.back() == '\r' || fline.back() == ' ')) fline.pop_back();
+      if (fline.rfind("usr/share/applications/", 0) != 0) continue;
+      if (fline.size() < 8 || fline.compare(fline.size() - 8, 8, ".desktop") != 0) continue;
+      std::string full = overlayRoot + "/" + fline;
+      if (fs::exists(full, ec)) {
+        ownedDesktops.push_back(full);
+      }
+    }
+  } else {
+    // No file list (older pacman db): fall back to an exact or reverse-DNS name match only.
+    for (const auto& entry : fs::directory_iterator(appDir, ec)) {
+      if (entry.path().extension() != ".desktop") continue;
       std::string stem = entry.path().stem().string();
-      if (stem == pkgName || stem.find(pkgName) != std::string::npos) {
-        foundDesktop = entry.path().string();
-        break;
+      if (stem == pkgName || (stem.size() > pkgName.size() &&
+                              stem.compare(stem.size() - pkgName.size(), pkgName.size(), pkgName) == 0 &&
+                              stem[stem.size() - pkgName.size() - 1] == '.')) {
+        ownedDesktops.push_back(entry.path().string());
       }
     }
   }
 
-  if (foundDesktop.empty()) return std::nullopt;
+  if (ownedDesktops.empty()) return std::nullopt;
+
+  // A package can ship several entries; take the one named after the package.
+  std::sort(ownedDesktops.begin(), ownedDesktops.end());
+  std::string foundDesktop = ownedDesktops.front();
+  for (const auto& d : ownedDesktops) {
+    std::string stem = fs::path(d).stem().string();
+    if (stem == pkgName) {
+      foundDesktop = d;
+      break;
+    }
+    if (stem.find(pkgName) != std::string::npos && foundDesktop == ownedDesktops.front()) {
+      foundDesktop = d;
+    }
+  }
 
   // Parse desktop file
   std::string dContent = ReadFile(foundDesktop);

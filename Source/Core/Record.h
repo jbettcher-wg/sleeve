@@ -32,6 +32,10 @@ struct DesktopInfo {
   std::string categories;
   std::string mimetypes;
   std::string exec_field {"%F"};
+  // Startup notification is off by default: nothing in this stack ever completes the
+  // handshake (wrapper script -> emulator -> guest toolkit, and the window's app_id
+  // does not match StartupWMClass), so the launcher's spinner would never stop.
+  bool startup_notify {false};
 };
 
 struct HealthInfo {
@@ -73,6 +77,18 @@ struct Settings {
 };
 
 AppRecord CreateFromCandidate(const Shapes::AppCandidate& cand, const std::string& defaultRootfs);
+
+// The options screen edits args and env as one line of text. These keep an argument that
+// contains a space intact across that round trip; splitting on whitespace quietly turned
+// one argument into two every time the screen was opened.
+std::string JoinArgsForEditing(const std::vector<std::string>& args);
+std::vector<std::string> SplitArgsFromEditing(const std::string& text);
+std::string JoinEnvForEditing(const std::map<std::string, std::string>& env);
+std::map<std::string, std::string> SplitEnvFromEditing(const std::string& text);
+
+// Record names become file names under the record, launcher and desktop directories.
+// Anything that could walk out of those directories is not a name.
+bool IsValidAppName(const std::string& name);
 
 std::optional<AppRecord> LoadRecord(const std::string& name);
 bool SaveRecord(const AppRecord& record);
