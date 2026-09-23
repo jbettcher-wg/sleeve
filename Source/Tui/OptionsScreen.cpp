@@ -33,14 +33,20 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
 
   // Emulator options
   auto cb_code_cache = Checkbox("Enable Code Caching (WIP)", &state->edit_code_cache);
-  std::vector<std::string> scope_entries = {"off", "rootfs", "home", "all"};
+  // Radiobox keeps the POINTER, and the component outlives this function, so
+  // these entries must not live on this stack frame. They did: by the time the
+  // options screen rendered, the vector was gone, Clamp() sized itself from
+  // freed memory and the std::length_error it threw took the process with it
+  // (SIGABRT through std::terminate, not a segfault). Function-local static:
+  // the contents are constant, so one shared copy is right.
+  static const std::vector<std::string> scope_entries = {"off", "rootfs", "home", "all"};
   auto radio_scope = Radiobox(&scope_entries, &state->edit_cache_scope_index);
   auto cb_cmp_fusion = Checkbox("Compare-Branch Fusion", &state->edit_cmp_fusion);
   auto cb_profile_stats = Checkbox("ProfileStats (/dev/shm/powerarm-<pid>-stats)", &state->edit_profile_stats);
   auto cb_mangohud = Checkbox("MangoHud HUD overlay", &state->editing_record.mangohud.enabled);
   auto input_emulator = Input(&state->edit_emulator_path, "stable via binfmt or /path/to/POWERarm");
 
-  auto btn_preview = Button(" Preview & Write ", [state, scope_entries]() {
+  auto btn_preview = Button(" Preview & Write ", [state]() {
     // Quote-aware: an argument or an env value may contain a space.
     state->editing_record.args = Record::SplitArgsFromEditing(state->edit_args_str);
     state->editing_record.env = Record::SplitEnvFromEditing(state->edit_env_str);
