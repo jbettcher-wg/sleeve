@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "App.h"
+#include "Actions.h"
 #include "Paths.h"
 #include "Generate.h"
 #include "FileWriter.h"
@@ -14,8 +15,15 @@
 #include <sys/inotify.h>
 #include <poll.h>
 #include <unistd.h>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 
 namespace Sleeve::Tui {
 
@@ -37,11 +45,86 @@ void AppState::Refresh() {
   rootfs_result = RootFS::DiscoverRootFSes();
 }
 
+namespace {
+
+// Repaint interval while a job runs. Fast enough that the elapsed counter and the
+// spinner read as motion rather than as a stuck screen.
+constexpr int kTickMs = 100;
+
+// How long to let an abandoned worker come back on the way out. Short, because a health
+// check can sit in Core for two minutes and quitting must not wait for it; if the budget
+// runs out the process leaves without running static destructors instead (see below).
+constexpr int kShutdownBudgetMs = 750;
+
+std::string OneDecimal(double v) {
+  std::ostringstream ss;
+  ss << std::fixed << std::setprecision(1) << v;
+  return ss.str();
+}
+
+// The panel that appears the instant a shortcut is pressed. It has to answer two
+// questions without being asked: what is happening, and is it still alive.
+Element WorkingPanel(const AppState& state) {
+  static const char* kFrames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+  double elapsed = state.job.ElapsedSeconds();
+  const char* frame = kFrames[static_cast<int>(elapsed * 10.0) % 10];
+
+  std::string progress = state.job.Progress();
+
+  Elements rows;
+  rows.push_back(hbox({
+      text(std::string(frame) + " ") | bold | color(Color::Palette16(3)),
+      text(state.job.Label()) | bold,
+  }));
+  if (!progress.empty()) {
+    rows.push_back(hbox({text("  "), paragraph(progress) | color(Color::Palette16(8))}));
+  }
+  rows.push_back(hbox({
+      text("  "),
+      text(OneDecimal(elapsed) + " s elapsed") | color(Color::Palette16(8)),
+  }));
+  rows.push_back(separator());
+  rows.push_back(text(" " + state.job.CancelHint()) |
+                 color(state.job.Cancellable() ? Color::Palette16(6) : Color::Palette16(8)));
+
+  return vbox(std::move(rows)) | size(WIDTH, LESS_THAN, 78) | borderRounded |
+         bgcolor(Color::Black) | clear_under;
+}
+
+// `h` starts the application. It says so, and names the command, before it does it.
+Element ConfirmLaunchPanel(const AppState& state) {
+  const auto& pending = state.pending_launch;
+  return vbox({
+             hbox({text(" Health check: ") | bold, text(pending.app_name) | bold |
+                                                       color(Color::Palette16(3))}),
+             separator(),
+             text("About to run:") | color(Color::Palette16(8)),
+             hbox({text("  "), paragraph(pending.command) | bold}),
+             text(""),
+             paragraph(pending.warning) | color(Color::Palette16(3)),
+             separator(),
+             hbox({
+                 text(" [enter]") | bold | color(Color::Palette16(6)),
+                 text(" run it   "),
+                 text("[esc]") | bold | color(Color::Palette16(6)),
+                 text(" don't — nothing has been launched "),
+             }),
+         }) |
+         size(WIDTH, LESS_THAN, 78) | borderRounded | bgcolor(Color::Black) | clear_under;
+}
+
+} // namespace
+
 int RunTui(const std::string& explicitTheme) {
   auto screen = ScreenInteractive::Fullscreen();
   AppState state;
+  state.theme_override = explicitTheme;
   state.palette = Theme::ResolvePalette(explicitTheme);
   state.Refresh();
+
+  // Workers wake the loop through this. Job clears its copy whenever the UI stops
+  // listening, so a worker that outlives the screen cannot post to it.
+  state.job.SetWake([&screen]() { screen.PostEvent(Event::Custom); });
 
   auto main_screen = CreateMainScreen(&state, &screen);
   auto scan_screen = CreateScanScreen(&state, &screen);
@@ -57,6 +140,28 @@ int RunTui(const std::string& explicitTheme) {
     preview_modal,
     health_screen,
   }, &tab_index);
+
+  auto root = Renderer(tab_container, [&]() {
+    // The ticker thread cannot read job.Running(): that is UI-thread state. This runs on
+    // the UI thread after every event, including the ones that start a job from a button
+    // inside a screen, so it is the one place that sees every transition.
+    state.ui_busy.store(state.job.Running(), std::memory_order_relaxed);
+
+    Element body = tab_container->Render();
+    if (!state.status_line.empty()) {
+      body = vbox({
+        body | flex,
+        hbox({text(" "), text(state.status_line) | color(Color::Palette16(8))}),
+      });
+    }
+    if (state.pending_launch.active) {
+      return dbox({body, ConfirmLaunchPanel(state) | center});
+    }
+    if (state.job.Running()) {
+      return dbox({body, WorkingPanel(state) | center});
+    }
+    return body;
+  });
 
   std::atomic<bool> stopWatcher{false};
   std::atomic<bool> themeNeedsUpdate{false};
@@ -87,11 +192,72 @@ int RunTui(const std::string& explicitTheme) {
     }
   }
 
-  auto global_handler = CatchEvent(tab_container, [&](Event event) {
+  // Keeps the elapsed counter and the spinner moving between a worker's own wakeups.
+  // It waits on a condition variable rather than sleeping so that quitting does not have
+  // to sit through a tick first.
+  std::mutex tickerMutex;
+  std::condition_variable tickerCv;
+  bool stopTicker = false;
+  std::thread tickerThread([&]() {
+    std::unique_lock<std::mutex> lock(tickerMutex);
+    while (!stopTicker) {
+      tickerCv.wait_for(lock, std::chrono::milliseconds(kTickMs), [&] { return stopTicker; });
+      if (stopTicker) {
+        break;
+      }
+      if (state.ui_busy.load(std::memory_order_relaxed)) {
+        screen.PostEvent(Event::Custom);
+      }
+    }
+  });
+
+  auto global_handler = CatchEvent(root, [&](Event event) {
+    // Picks up a finished worker and copies its result in, on this thread. Everything a
+    // worker produced enters AppState here and nowhere else.
+    state.job.Collect();
+
     if (themeNeedsUpdate.exchange(false)) {
-      state.palette = Theme::ResolvePalette(explicitTheme);
-      state.Refresh();
+      // The theme changed under us. Reloading it reads a file and shells out to
+      // omarchy-theme-color, so it goes through a job like everything else -- and the
+      // event that happened to arrive at the same moment is not swallowed any more.
+      StartThemeReload(state);
+    }
+
+    // The launch confirmation owns the keyboard while it is up.
+    if (state.pending_launch.active) {
+      if (event == Event::Return || event == Event::Character('y')) {
+        StartHealthCheck(state);
+      } else if (event == Event::Escape || event == Event::Character('n') ||
+                 event == Event::Character('q')) {
+        state.pending_launch = AppState::PendingLaunch{};
+        state.status_line = "health check declined — nothing was launched";
+      }
       return true;
+    }
+
+    if (state.job.Running()) {
+      if (event == Event::Escape) {
+        if (state.job.Cancellable()) {
+          std::string label = state.job.Label();
+          state.job.Cancel();
+          state.status_line = label + " — cancelled";
+        }
+        return true;
+      }
+      if (event == Event::Character('q')) {
+        screen.ExitLoopClosure()();
+        return true;
+      }
+      // The keys that would start a second long action. Job::Start refuses them anyway;
+      // swallowing them here keeps them from reaching a screen that would act on them,
+      // and says why instead of doing nothing visible.
+      if (event == Event::Character('s') || event == Event::Character('t') ||
+          event == Event::Character('h') || event == Event::Character('w')) {
+        state.status_line = state.job.Label() + " is still running";
+        return true;
+      }
+      // Everything else -- arrows, tab, typing -- still reaches the screen underneath,
+      // because the loop is not blocked any more.
     }
 
     if (event == Event::Character('q') || event == Event::Escape) {
@@ -106,65 +272,28 @@ int RunTui(const std::string& explicitTheme) {
 
     if (state.current_tab == ScreenTab::Main) {
       if (event == Event::Character('s')) {
-        Scanner::ScanOptions opt;
-        state.scan_result = Scanner::RunScan(opt);
-        state.scan_selected.assign(state.scan_result.apps.size(), {true});
-        state.current_tab = ScreenTab::Scan;
-        tab_index = 1;
+        StartScan(state);
         return true;
       }
       if (event == Event::Character('t')) {
-        state.palette = Theme::ResolvePalette(explicitTheme);
+        StartThemeReload(state);
         return true;
       }
       if (event == Event::Character('h')) {
-        if (state.selected_app_index >= 0 && state.selected_app_index < static_cast<int>(state.records.size())) {
-          auto& rec = state.records[state.selected_app_index];
-          Health::CheckOptions hopt;
-          hopt.mode = Health::CheckMode::Version;
-          hopt.timeout_seconds = 20.0;
-          hopt.wmclass = rec.desktop.wmclass;
-          state.current_health_result = Health::RunCheck(rec, hopt);
-          state.current_tab = ScreenTab::Health;
-          tab_index = 4;
-          state.Refresh();
-          return true;
+        if (!PrepareHealthCheck(state)) {
+          state.status_line = "nothing selected to check";
         }
+        return true;
       }
       if (event == Event::Character('w')) {
-        if (state.selected_app_index >= 0 && state.selected_app_index < static_cast<int>(state.records.size())) {
-          const auto& rec = state.records[state.selected_app_index];
-          auto gen = Generate::GenerateFiles(rec);
-          state.files_to_write.clear();
-          state.preview_diffs.clear();
-          state.editing_record = rec;
-
-          // 1. Launcher
-          auto lStatus = FileWriter::CheckStatus(gen.launcher_path, rec.generated.count(gen.launcher_path) ? rec.generated.at(gen.launcher_path) : "");
-          state.files_to_write.push_back({gen.launcher_path, gen.launcher_content});
-          state.preview_diffs.push_back(Diff::UnifiedDiff(lStatus.existing_content, gen.launcher_content,
-                                                          gen.launcher_path + " (current)", gen.launcher_path + " (new)"));
-
-          // 2. Desktop entry
-          if (gen.has_desktop) {
-            auto dStatus = FileWriter::CheckStatus(gen.desktop_path, rec.generated.count(gen.desktop_path) ? rec.generated.at(gen.desktop_path) : "");
-            state.files_to_write.push_back({gen.desktop_path, gen.desktop_content});
-            state.preview_diffs.push_back(Diff::UnifiedDiff(dStatus.existing_content, gen.desktop_content,
-                                                            gen.desktop_path + " (current)", gen.desktop_path + " (new)"));
-          }
-
-          // 3. AppConfig
-          if (gen.has_appconfig) {
-            auto aStatus = FileWriter::CheckStatus(gen.appconfig_path, rec.generated.count(gen.appconfig_path) ? rec.generated.at(gen.appconfig_path) : "");
-            state.files_to_write.push_back({gen.appconfig_path, gen.appconfig_content});
-            state.preview_diffs.push_back(Diff::UnifiedDiff(aStatus.existing_content, gen.appconfig_content,
-                                                            gen.appconfig_path + " (current)", gen.appconfig_path + " (new)"));
-          }
-
-          state.current_tab = ScreenTab::Preview;
-          tab_index = 3;
-          return true;
+        if (state.selected_app_index >= 0 &&
+            state.selected_app_index < static_cast<int>(state.records.size())) {
+          state.editing_record = state.records[state.selected_app_index];
+          StartPreviewBuild(state, /*saveFirst=*/false);
+        } else {
+          state.status_line = "nothing selected to write";
         }
+        return true;
       }
     }
 
@@ -182,9 +311,28 @@ int RunTui(const std::string& explicitTheme) {
 
   screen.Loop(global_handler);
 
+  {
+    std::lock_guard<std::mutex> lock(tickerMutex);
+    stopTicker = true;
+  }
+  tickerCv.notify_all();
+  tickerThread.join();
+
   stopWatcher.store(true);
   if (watcherThread.joinable()) {
     watcherThread.join();
+  }
+
+  // Quitting mid-scan is allowed; quitting into a use-after-free is not. A worker that
+  // is still inside Scanner::RunScan or Health::RunCheck is reading Backend's namespace
+  // -scope strings, and returning from here would start destroying them under it. There
+  // is no way to join it -- that is the freeze this whole change removes -- so give it a
+  // short chance to come back and otherwise leave without running static destructors at
+  // all. ftxui has already put the terminal back by the time Loop() returns, and there
+  // is nothing after RunTui but `return` in main.
+  if (!state.job.Shutdown(std::chrono::milliseconds(kShutdownBudgetMs))) {
+    std::fflush(nullptr);
+    std::_Exit(0);
   }
 
   return 0;

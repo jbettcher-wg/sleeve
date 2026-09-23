@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "App.h"
+#include "Actions.h"
 #include "Paths.h"
 #include "Generate.h"
 #include "FileWriter.h"
@@ -39,7 +40,7 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
   auto cb_mangohud = Checkbox("MangoHud HUD overlay", &state->editing_record.mangohud.enabled);
   auto input_emulator = Input(&state->edit_emulator_path, "stable via binfmt or /path/to/POWERarm");
 
-  auto btn_preview = Button(" Preview & Write ", [state, screen, scope_entries]() {
+  auto btn_preview = Button(" Preview & Write ", [state, scope_entries]() {
     // Quote-aware: an argument or an env value may contain a space.
     state->editing_record.args = Record::SplitArgsFromEditing(state->edit_args_str);
     state->editing_record.env = Record::SplitEnvFromEditing(state->edit_env_str);
@@ -58,42 +59,10 @@ Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen) {
       state->editing_record.emulator = state->edit_emulator_path;
     }
 
-    // Save record updates
-    Record::SaveRecord(state->editing_record);
-    state->Refresh();
-
-    // Prepare diffs for preview modal
-    auto gen = Generate::GenerateFiles(state->editing_record);
-    state->files_to_write.clear();
-    state->preview_diffs.clear();
-
-    // 1. Launcher
-    auto launcherStatus = FileWriter::CheckStatus(gen.launcher_path);
-    std::string launcherDiff = Diff::UnifiedDiff(launcherStatus.existing_content, gen.launcher_content,
-                                                 gen.launcher_path + " (current)", gen.launcher_path + " (new)");
-    state->files_to_write.push_back({gen.launcher_path, gen.launcher_content});
-    state->preview_diffs.push_back(launcherDiff);
-
-    // 2. Desktop entry
-    if (gen.has_desktop) {
-      auto desktopStatus = FileWriter::CheckStatus(gen.desktop_path);
-      std::string desktopDiff = Diff::UnifiedDiff(desktopStatus.existing_content, gen.desktop_content,
-                                                  gen.desktop_path + " (current)", gen.desktop_path + " (new)");
-      state->files_to_write.push_back({gen.desktop_path, gen.desktop_content});
-      state->preview_diffs.push_back(desktopDiff);
-    }
-
-    // 3. AppConfig
-    if (gen.has_appconfig) {
-      auto acStatus = FileWriter::CheckStatus(gen.appconfig_path);
-      std::string acDiff = Diff::UnifiedDiff(acStatus.existing_content, gen.appconfig_content,
-                                             gen.appconfig_path + " (current)", gen.appconfig_path + " (new)");
-      state->files_to_write.push_back({gen.appconfig_path, gen.appconfig_content});
-      state->preview_diffs.push_back(acDiff);
-    }
-
-    state->current_tab = ScreenTab::Preview;
-    screen->PostEvent(Event::Custom);
+    // Saving the record, generating three files, hashing what is already on disk and
+    // diffing each one is all file I/O. It used to run here, on the UI thread, with the
+    // screen frozen until it finished.
+    StartPreviewBuild(*state, /*saveFirst=*/true);
   });
 
   auto btn_back = Button(" Back ", [state, screen]() {

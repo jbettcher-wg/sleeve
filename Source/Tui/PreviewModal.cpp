@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "App.h"
+#include "Actions.h"
 #include "FileWriter.h"
 
 #include <ftxui/component/component.hpp>
@@ -15,20 +16,11 @@ using namespace ftxui;
 Component CreatePreviewModal(AppState* state, ScreenInteractive* screen) {
   auto container = Container::Vertical({});
 
-  auto btn_write_all = Button(" Write All ", [state, screen]() {
-    for (const auto& [path, content] : state->files_to_write) {
-      mode_t mode = (path.find("/bin/") != std::string::npos) ? 0755 : 0644;
-      FileWriter::AtomicWrite(path, content, mode);
-
-      // Record the hash in the app record if applicable
-      std::string sha = FileWriter::ComputeSha256(content);
-      state->editing_record.generated[path] = sha;
-    }
-    Record::SaveRecord(state->editing_record);
-    state->Refresh();
-    state->current_tab = ScreenTab::Main;
-    screen->PostEvent(Event::Custom);
-  });
+  // Writing three files atomically, hashing each one and saving the record is file I/O
+  // on whatever disk the launcher lives on. It runs on a worker; the write itself is the
+  // one job that [esc] does not interrupt, because a half-written set is worse than a
+  // wait.
+  auto btn_write_all = Button(" Write All ", [state]() { StartWriteFiles(*state); });
 
   auto btn_cancel = Button(" Cancel ", [state, screen]() {
     state->current_tab = ScreenTab::Main;
