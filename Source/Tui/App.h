@@ -6,6 +6,7 @@
 #include "RootFS.h"
 #include "Theme.h"
 #include "Health.h"
+#include "Libs.h"
 #include "Job.h"
 
 #include <atomic>
@@ -23,6 +24,7 @@ enum class ScreenTab {
   RootFS,
   Preview,
   Health,
+  Libs,
 };
 
 struct AppState {
@@ -63,6 +65,13 @@ struct AppState {
   // Health state
   Health::CheckResult current_health_result;
 
+  // Library state: what the static pass found, what guest pacman says owns it, and
+  // whether there is a usable guest to resolve against in the first place.
+  Libs::ScanResult libs_result;
+  Libs::PackagePlan libs_plan;
+  RootFS::ReadinessReport libs_readiness;
+  bool libs_scanned {false};
+
   // --- Background work ---
   //
   // One job at a time. The actions on offer here are mutually exclusive as far as the
@@ -84,15 +93,18 @@ struct AppState {
   // scan. Delivering a scan result calls this, on the UI thread, to rebuild it.
   std::function<void()> on_scan_result_changed;
 
-  // A health check starts the application for real. Nothing is launched until this has
-  // been shown and accepted.
-  struct PendingLaunch {
+  // Anything that starts a program, downloads a gigabyte or writes into a guest every
+  // other session shares says so first, names the exact command, and does nothing until
+  // it is accepted. One panel, because it is one question.
+  struct PendingConfirm {
     bool active {false};
-    std::string app_name;
+    std::string title;
     std::string command;
     std::string warning;
+    // Runs on the UI thread when the person says yes; it starts the job.
+    std::function<void()> on_accept;
   };
-  PendingLaunch pending_launch;
+  PendingConfirm pending_confirm;
 
   void Refresh();
 };

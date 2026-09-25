@@ -74,6 +74,12 @@ struct Settings {
   std::string apps_dir;
   std::vector<std::string> scan_dirs;
   std::string last_theme;
+  // Repository base URLs handed to POWERarmRootFSFetcher, in order, when sleeve builds a
+  // rootfs. A list rather than a string, and empty by default: the fetcher already knows
+  // POWERarm's pinned snapshot and upstream Arch Linux ARM, and sleeve having a default
+  // of its own is only a way for the two to drift apart. Adding one later is an edit to
+  // this file, not to any code.
+  std::vector<std::string> rootfs_mirrors;
 };
 
 AppRecord CreateFromCandidate(const Shapes::AppCandidate& cand, const std::string& defaultRootfs);

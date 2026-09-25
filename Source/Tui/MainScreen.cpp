@@ -154,6 +154,7 @@ Component CreateMainScreen(AppState* state, ScreenInteractive* screen) {
       text("[enter]") | bold | color(accentCol), text(" options  "),
       text("[w]") | bold | color(accentCol), text(" write files  "),
       text("[h]") | bold | color(accentCol), text(" health check  "),
+      text("[l]") | bold | color(accentCol), text(" libraries  "),
       text("[t]") | bold | color(accentCol), text(" theme  "),
       text("[q]") | bold | color(accentCol), text(" quit "),
     });

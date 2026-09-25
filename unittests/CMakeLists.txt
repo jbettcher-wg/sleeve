@@ -8,6 +8,7 @@ add_executable(SleeveTests
   Test_Theme.cpp
   Test_AppConfigWriter.cpp
   Test_Health.cpp
+  Test_Libs.cpp
   Test_Record.cpp
   Test_Scanner.cpp
   # The TUI's background-work layer. It deliberately depends on nothing but the standard

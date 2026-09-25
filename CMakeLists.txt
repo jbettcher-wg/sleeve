@@ -26,6 +26,7 @@ set(SLEEVE_CORE_SRCS
   Source/Core/Process.cpp
   Source/Core/AppConfigWriter.cpp
   Source/Core/Health.cpp
+  Source/Core/Libs.cpp
   External/tiny-json/tiny-json.c
 )
 
@@ -50,6 +51,7 @@ set(SLEEVE_TUI_SRCS
   Source/Tui/OptionsScreen.cpp
   Source/Tui/PreviewModal.cpp
   Source/Tui/HealthScreen.cpp
+  Source/Tui/LibsScreen.cpp
 )
 
 add_executable(sleeve

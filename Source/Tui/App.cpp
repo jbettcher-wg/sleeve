@@ -34,6 +34,7 @@ Component CreateScanScreen(AppState* state, ScreenInteractive* screen);
 Component CreateOptionsScreen(AppState* state, ScreenInteractive* screen);
 Component CreatePreviewModal(AppState* state, ScreenInteractive* screen);
 Component CreateHealthScreen(AppState* state, ScreenInteractive* screen);
+Component CreateLibsScreen(AppState* state, ScreenInteractive* screen);
 
 void AppState::Refresh() {
   records = Record::ListRecords();
@@ -91,12 +92,11 @@ Element WorkingPanel(const AppState& state) {
          bgcolor(Color::Black) | clear_under;
 }
 
-// `h` starts the application. It says so, and names the command, before it does it.
-Element ConfirmLaunchPanel(const AppState& state) {
-  const auto& pending = state.pending_launch;
+// Whatever is about to happen, it says so and names the command before it does it.
+Element ConfirmPanel(const AppState& state) {
+  const auto& pending = state.pending_confirm;
   return vbox({
-             hbox({text(" Health check: ") | bold, text(pending.app_name) | bold |
-                                                       color(Color::Palette16(3))}),
+             hbox({text(" ") , text(pending.title) | bold | color(Color::Palette16(3))}),
              separator(),
              text("About to run:") | color(Color::Palette16(8)),
              hbox({text("  "), paragraph(pending.command) | bold}),
@@ -105,9 +105,9 @@ Element ConfirmLaunchPanel(const AppState& state) {
              separator(),
              hbox({
                  text(" [enter]") | bold | color(Color::Palette16(6)),
-                 text(" run it   "),
+                 text(" do it   "),
                  text("[esc]") | bold | color(Color::Palette16(6)),
-                 text(" don't — nothing has been launched "),
+                 text(" don't — nothing has happened yet "),
              }),
          }) |
          size(WIDTH, LESS_THAN, 78) | borderRounded | bgcolor(Color::Black) | clear_under;
@@ -131,6 +131,7 @@ int RunTui(const std::string& explicitTheme) {
   auto options_screen = CreateOptionsScreen(&state, &screen);
   auto preview_modal = CreatePreviewModal(&state, &screen);
   auto health_screen = CreateHealthScreen(&state, &screen);
+  auto libs_screen = CreateLibsScreen(&state, &screen);
 
   int tab_index = 0;
   auto tab_container = Container::Tab({
@@ -139,6 +140,7 @@ int RunTui(const std::string& explicitTheme) {
     options_screen,
     preview_modal,
     health_screen,
+    libs_screen,
   }, &tab_index);
 
   auto root = Renderer(tab_container, [&]() {
@@ -154,8 +156,8 @@ int RunTui(const std::string& explicitTheme) {
         hbox({text(" "), text(state.status_line) | color(Color::Palette16(8))}),
       });
     }
-    if (state.pending_launch.active) {
-      return dbox({body, ConfirmLaunchPanel(state) | center});
+    if (state.pending_confirm.active) {
+      return dbox({body, ConfirmPanel(state) | center});
     }
     if (state.job.Running()) {
       return dbox({body, WorkingPanel(state) | center});
@@ -223,14 +225,17 @@ int RunTui(const std::string& explicitTheme) {
       StartThemeReload(state);
     }
 
-    // The launch confirmation owns the keyboard while it is up.
-    if (state.pending_launch.active) {
+    // The confirmation owns the keyboard while it is up.
+    if (state.pending_confirm.active) {
       if (event == Event::Return || event == Event::Character('y')) {
-        StartHealthCheck(state);
+        auto accept = state.pending_confirm.on_accept;
+        state.pending_confirm = AppState::PendingConfirm{};
+        if (accept) accept();
       } else if (event == Event::Escape || event == Event::Character('n') ||
                  event == Event::Character('q')) {
-        state.pending_launch = AppState::PendingLaunch{};
-        state.status_line = "health check declined — nothing was launched";
+        std::string what = state.pending_confirm.title;
+        state.pending_confirm = AppState::PendingConfirm{};
+        state.status_line = what + " declined — nothing was run";
       }
       return true;
     }
@@ -252,7 +257,8 @@ int RunTui(const std::string& explicitTheme) {
       // swallowing them here keeps them from reaching a screen that would act on them,
       // and says why instead of doing nothing visible.
       if (event == Event::Character('s') || event == Event::Character('t') ||
-          event == Event::Character('h') || event == Event::Character('w')) {
+          event == Event::Character('h') || event == Event::Character('w') ||
+          event == Event::Character('l')) {
         state.status_line = state.job.Label() + " is still running";
         return true;
       }
@@ -285,6 +291,12 @@ int RunTui(const std::string& explicitTheme) {
         }
         return true;
       }
+      if (event == Event::Character('l')) {
+        if (!StartLibsScan(state)) {
+          state.status_line = "nothing selected to check for libraries";
+        }
+        return true;
+      }
       if (event == Event::Character('w')) {
         if (state.selected_app_index >= 0 &&
             state.selected_app_index < static_cast<int>(state.records.size())) {
@@ -303,6 +315,7 @@ int RunTui(const std::string& explicitTheme) {
       case ScreenTab::Options: tab_index = 2; break;
       case ScreenTab::Preview: tab_index = 3; break;
       case ScreenTab::Health:  tab_index = 4; break;
+      case ScreenTab::Libs:    tab_index = 5; break;
       default:                 tab_index = 0; break;
     }
 

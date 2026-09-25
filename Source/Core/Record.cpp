@@ -595,6 +595,14 @@ Settings LoadSettings() {
     }
   }
 
+  const json_t* mirrors = json_getProperty(root, "rootfs_mirrors");
+  if (mirrors) {
+    for (const json_t* it = json_getChild(mirrors); it; it = json_getSibling(it)) {
+      const char* val = json_getValue(it);
+      if (val && val[0] != '\0') s.rootfs_mirrors.push_back(val);
+    }
+  }
+
   return s;
 }
 
@@ -610,6 +618,11 @@ bool SaveSettings(const Settings& settings) {
   ss << "  \"scan_dirs\": [";
   for (size_t i = 0; i < settings.scan_dirs.size(); ++i) {
     ss << (i > 0 ? ", " : "") << "\"" << EscapeString(settings.scan_dirs[i]) << "\"";
+  }
+  ss << "],\n";
+  ss << "  \"rootfs_mirrors\": [";
+  for (size_t i = 0; i < settings.rootfs_mirrors.size(); ++i) {
+    ss << (i > 0 ? ", " : "") << "\"" << EscapeString(settings.rootfs_mirrors[i]) << "\"";
   }
   ss << "]\n";
   ss << "}\n";

@@ -329,4 +329,192 @@ ResolvedRootFS ResolveRootFSName(const std::string& nameOrPath) {
   return res;
 }
 
+
+// --------------------------------------------------------------------------
+// Readiness and provisioning
+// --------------------------------------------------------------------------
+
+namespace {
+
+// The fetcher that builds a guest. It is self-sufficient -- POWERarm's own pinned
+// package snapshot, the overlay, guest pacman and the config write -- so this drives it
+// and reimplements none of it.
+std::string FetcherBinary() {
+  const auto& backend = Backend::GetActiveBackend();
+  return backend.displayName + "RootFSFetcher";
+}
+
+// The overlay directory the emulator would pick up for a base: "<base>-overlay" when it
+// exists (RootFSOverlay::ConfiguredPath).
+std::string OverlayPathFor(const std::string& basePath) {
+  std::error_code ec;
+  std::string candidate = basePath + "-overlay";
+  return fs::is_directory(candidate, ec) ? candidate : std::string();
+}
+
+} // namespace
+
+ReadinessReport CheckReadiness(const std::string& nameOrPath) {
+  const auto& backend = Backend::GetActiveBackend();
+  ReadinessReport report;
+  report.requested = nameOrPath;
+
+  std::string wanted = nameOrPath;
+  if (wanted.empty()) {
+    auto discovered = DiscoverRootFSes();
+    if (!discovered.env_rootfs.empty()) {
+      wanted = discovered.env_rootfs;
+    } else if (!discovered.config_default_rootfs.empty()) {
+      wanted = discovered.config_default_rootfs;
+    } else if (!discovered.rootfses.empty()) {
+      wanted = discovered.rootfses.front().base_path;
+    } else {
+      wanted = backend.defaultRootfsDesktop;
+    }
+    report.requested = wanted;
+  }
+
+  auto resolved = ResolveRootFSName(wanted);
+  std::error_code ec;
+
+  if (!resolved.ok) {
+    // Discovery drops a tree of the wrong architecture, so "not found" and "found but
+    // foreign" arrive here the same way. Tell them apart, because only one of them is
+    // fixed by building a guest at that name.
+    std::string expanded = Paths::ExpandUser(wanted);
+    if (expanded.find('/') != std::string::npos && fs::is_directory(expanded, ec)) {
+      report.state = Readiness::WrongArch;
+      report.rootfs_path = expanded;
+      report.elf_machine = DetectRootFSMachine(expanded);
+      report.summary = expanded + " is not a " + backend.archName +
+                       " tree (its own userspace reports ELF machine " +
+                       std::to_string(report.elf_machine) + "), so " + backend.displayName +
+                       " would fall off it into host binaries.";
+      report.fix_hint = FetcherBinary() + " build --dest " + expanded + " --force";
+      report.auto_fixable = true;
+      return report;
+    }
+    report.state = Readiness::Missing;
+    report.summary = "there is no " + backend.archName + " rootfs called '" + wanted +
+                     "'; a guest has to be built before anything can run under " +
+                     backend.displayName + ".";
+    report.fix_hint = FetcherBinary() + " build" +
+                      (wanted == backend.defaultRootfsDesktop ? "" : " " + wanted);
+    report.auto_fixable = true;
+    return report;
+  }
+
+  report.rootfs_path = resolved.path;
+  report.elf_machine = DetectRootFSMachine(resolved.path);
+  if (report.elf_machine != 0 && report.elf_machine != backend.elfMachine) {
+    report.state = Readiness::WrongArch;
+    report.summary = resolved.path + " reports ELF machine " + std::to_string(report.elf_machine) +
+                     ", not the " + std::to_string(backend.elfMachine) + " " + backend.displayName +
+                     " runs.";
+    report.fix_hint = FetcherBinary() + " build --dest " + resolved.path + " --force";
+    report.auto_fixable = true;
+    return report;
+  }
+
+  report.overlay_path = OverlayPathFor(resolved.path);
+  if (report.overlay_path.empty()) {
+    report.state = Readiness::NoOverlay;
+    report.summary = resolved.path +
+                     " has no per-user overlay, so guest pacman has nowhere to install into. "
+                     "The base alone is a sysroot, not a desktop guest.";
+    report.fix_hint = FetcherBinary() + " overlay " + fs::path(resolved.path).filename().string() +
+                      " --manifest <the one that built this base>";
+    report.auto_fixable = false;
+    return report;
+  }
+
+  // An overlay directory can exist, be non-empty, and still be unfinished: the package
+  // database lands before the packages do, so a run that died partway leaves
+  // /var/lib/pacman full and /usr/bin/pacman missing. Installing into that fails in a way
+  // that reads like an emulator problem, so it is checked here instead.
+  report.guest_pacman = fs::exists(report.overlay_path + "/usr/bin/pacman", ec);
+  if (!report.guest_pacman) {
+    report.state = Readiness::OverlayIncomplete;
+    report.summary = report.overlay_path +
+                     " exists but has no /usr/bin/pacman: a build died partway through, and "
+                     "nothing can be installed into it until it is rebuilt.";
+    report.fix_hint = FetcherBinary() + " overlay " + fs::path(resolved.path).filename().string() +
+                      " --manifest <the one that built this base> --force";
+    report.auto_fixable = false;
+    return report;
+  }
+
+  report.state = Readiness::Ok;
+  report.summary = resolved.path + " is a " + backend.archName +
+                   " guest with a writable overlay and guest pacman in it.";
+  return report;
+}
+
+ProvisionOptions ProvisionOptionsFromSettings() {
+  ProvisionOptions options;
+  options.mirrors = Record::LoadSettings().rootfs_mirrors;
+  return options;
+}
+
+Process::ProcessOptions BuildProvisionCommand(const ProvisionOptions& options) {
+  Process::ProcessOptions opt;
+  opt.args.push_back(FetcherBinary());
+  opt.args.push_back("build");
+  if (!options.name.empty()) opt.args.push_back(options.name);
+  if (!options.manifest.empty()) opt.args.push_back("--manifest=" + options.manifest);
+  if (!options.dest.empty()) opt.args.push_back("--dest=" + options.dest);
+  for (const auto& mirror : options.mirrors) opt.args.push_back("--mirror=" + mirror);
+  if (options.force) opt.args.push_back("--force");
+  if (!options.set_default) opt.args.push_back("--no-set-default");
+  if (options.dry_run) opt.args.push_back("--dry-run");
+  // sleeve has already shown the plan and been told yes; the fetcher must not then sit
+  // on a prompt that a TUI worker thread has no way to answer.
+  opt.args.push_back("-y");
+  // A base is ~860 MB of downloads and ~1.9 GB written, on a machine that may be
+  // building it over a slow link. An hour is not generous.
+  opt.timeout_seconds = options.dry_run ? 120.0 : 7200.0;
+  return opt;
+}
+
+Process::ProcessOptions BuildOverlayCommand(const ProvisionOptions& options) {
+  Process::ProcessOptions opt;
+  opt.args.push_back(FetcherBinary());
+  opt.args.push_back("overlay");
+  if (!options.name.empty()) opt.args.push_back(options.name);
+  if (!options.manifest.empty()) opt.args.push_back("--manifest=" + options.manifest);
+  for (const auto& mirror : options.mirrors) opt.args.push_back("--mirror=" + mirror);
+  if (options.force) opt.args.push_back("--force");
+  if (options.dry_run) opt.args.push_back("--dry-run");
+  opt.args.push_back("-y");
+  opt.timeout_seconds = options.dry_run ? 120.0 : 3600.0;
+  return opt;
+}
+
+namespace {
+
+Process::RunOutcome RunFetcher(const Process::ProcessOptions& opt, const Process::Runner& run) {
+  Process::RunOutcome outcome;
+  outcome.command = Process::Describe(opt);
+  auto res = Process::Execute(run, opt);
+  outcome.output = res.stdout_str + res.stderr_str;
+  outcome.ok = (res.exit_code == 0 && !res.timed_out);
+  if (!outcome.ok) {
+    outcome.error = res.timed_out ? "the build timed out"
+                                  : (opt.args.empty() ? "nothing to run"
+                                                      : opt.args[0] + " exited " +
+                                                            std::to_string(res.exit_code));
+  }
+  return outcome;
+}
+
+} // namespace
+
+Process::RunOutcome Provision(const ProvisionOptions& options, const Process::Runner& run) {
+  return RunFetcher(BuildProvisionCommand(options), run);
+}
+
+Process::RunOutcome ProvisionOverlay(const ProvisionOptions& options, const Process::Runner& run) {
+  return RunFetcher(BuildOverlayCommand(options), run);
+}
+
 } // namespace Sleeve::RootFS

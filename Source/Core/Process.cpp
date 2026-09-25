@@ -10,8 +10,41 @@
 #include <chrono>
 #include <vector>
 #include <cstring>
+#include <cctype>
 
 namespace Sleeve::Process {
+
+ProcessResult Execute(const Runner& runner, const ProcessOptions& options) {
+  return runner ? runner(options) : RunCommand(options);
+}
+
+std::string Describe(const ProcessOptions& options) {
+  auto quote = [](const std::string& word) {
+    bool needs = word.empty();
+    for (char c : word) {
+      if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '/' || c == '.' || c == '-' ||
+            c == '_' || c == '=' || c == '+' || c == ':' || c == ',' || c == '@' || c == '~')) {
+        needs = true;
+        break;
+      }
+    }
+    if (!needs) return word;
+    std::string out = "'";
+    for (char c : word) {
+      if (c == '\'') out += "'\\''";
+      else out += c;
+    }
+    return out + "'";
+  };
+
+  std::string out;
+  for (const auto& [k, v] : options.env) out += k + "=" + quote(v) + " ";
+  for (size_t i = 0; i < options.args.size(); ++i) {
+    if (i) out += " ";
+    out += quote(options.args[i]);
+  }
+  return out;
+}
 
 ProcessResult RunCommand(const std::vector<std::string>& args, double timeout_seconds) {
   ProcessOptions opt;

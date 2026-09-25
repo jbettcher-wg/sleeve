@@ -12,6 +12,8 @@
 #include "ElfInspect.h"
 #include "AppConfigWriter.h"
 #include "Health.h"
+#include "Libs.h"
+#include "Process.h"
 #include "Backend.h"
 
 #include <iostream>
@@ -21,6 +23,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <map>
+#include <fstream>
+#include <sstream>
 
 namespace fs = std::filesystem;
 using namespace Sleeve;
@@ -38,9 +42,19 @@ static void PrintHelp() {
             << "  sleeve set NAME [OPTIONS...]         Configure app settings (rootfs=, cache=, fusion=, startupnotify=, ...)\n"
             << "  sleeve wrap NAME [--dry-run] [--yes] Generate launcher, desktop, and AppConfig files\n"
             << "  sleeve check NAME [--version|--sec N] Run health check on app\n"
+            << "  sleeve libs NAME [OPTIONS...]        Report unmet guest libraries; install them with --install\n"
             << "  sleeve rootfs list [--json]          List discovered rootfses\n"
             << "  sleeve rootfs use NAME [--dry-run]   Set default RootFS in Config.json\n"
+            << "  sleeve rootfs check [NAME]           Is this rootfs usable? (non-zero if not)\n"
+            << "  sleeve rootfs build [NAME] [--force] Build a guest with POWERarmRootFSFetcher (needs --yes)\n"
             << "  sleeve theme                         Show resolved theme palette\n\n"
+            << "'sleeve libs' options:\n"
+            << "  --packages                           Also map the unmet sonames to guest packages\n"
+            << "  --install                            Install the mapped packages into the overlay (needs --yes)\n"
+            << "  --sync                               Refresh the guest file database, pacman -Fy (needs --yes)\n"
+            << "  --run                                Run the app once and add the sonames it named (dlopen)\n"
+            << "  --build                              Build the rootfs when there is none (needs --yes)\n"
+            << "  --no-log                             Ignore the sonames the last health check named\n\n"
             << "Global options:\n"
             << "  --backend ID                         Target emulator backend (powerarm, fastppcx86)\n"
             << "  --theme FILE                         Path to custom colors.toml\n"
@@ -48,6 +62,32 @@ static void PrintHelp() {
             << "  --dry-run                            Show diffs without writing files\n"
             << "  --yes, -y                            Non-interactive execution\n"
             << "  --help, -h                           Show this help message\n";
+}
+
+
+// A readiness report, written out the same way wherever it is shown. It is the answer to
+// "why can nothing run here", and the fix is a command, not advice.
+static void PrintReadiness(const Sleeve::RootFS::ReadinessReport& report) {
+  bool ok = (report.state == RootFS::Readiness::Ok);
+  std::cout << (ok ? "✓ " : "✗ ") << report.summary << "\n";
+  if (!report.fix_hint.empty()) {
+    std::cout << "  fix: " << report.fix_hint << "\n";
+    if (!report.auto_fixable) {
+      std::cout << "  (sleeve does not run this one for you: the fetcher has to be told which\n"
+                   "   manifest built the base, and only you know that)\n";
+    }
+  }
+}
+
+static const char* ReadinessName(Sleeve::RootFS::Readiness state) {
+  switch (state) {
+    case RootFS::Readiness::Ok: return "ok";
+    case RootFS::Readiness::Missing: return "missing";
+    case RootFS::Readiness::WrongArch: return "wrong_arch";
+    case RootFS::Readiness::NoOverlay: return "no_overlay";
+    case RootFS::Readiness::OverlayIncomplete: return "overlay_incomplete";
+  }
+  return "unknown";
 }
 
 int main(int argc, char** argv) {
@@ -616,8 +656,401 @@ int main(int argc, char** argv) {
     return (res.status == "ok") ? 0 : 1;
   }
 
+  // 8b. LIBS
+  if (cmd == "libs") {
+    if (filteredArgs.size() < 2) {
+      std::cerr << "Error: 'sleeve libs' requires app name\n";
+      return 1;
+    }
+    std::string name = filteredArgs[1];
+    auto rec = Record::LoadRecord(name);
+    if (!rec) {
+      std::cerr << "Error: app '" << name << "' not found\n";
+      return 1;
+    }
+
+    bool wantPackages = false;
+    bool wantInstall = false;
+    bool wantSync = false;
+    bool wantRun = false;
+    bool wantBuild = false;
+    bool useLog = true;
+    for (size_t i = 2; i < filteredArgs.size(); ++i) {
+      const std::string& opt = filteredArgs[i];
+      if (opt == "--packages") wantPackages = true;
+      else if (opt == "--install") { wantInstall = true; wantPackages = true; }
+      else if (opt == "--sync") wantSync = true;
+      else if (opt == "--run") wantRun = true;
+      else if (opt == "--build") wantBuild = true;
+      else if (opt == "--no-log") useLog = false;
+      else {
+        std::cerr << "Error: unknown option for 'sleeve libs': " << opt << "\n";
+        return 1;
+      }
+    }
+
+    // A missing rootfs and a missing libnspr4.so are the same conversation, so they are
+    // answered in the same place: nothing can be resolved against a guest that is not
+    // there, and nothing can be installed into an overlay that has no pacman in it.
+    auto readiness = RootFS::CheckReadiness(rec->rootfs);
+    if (readiness.state != RootFS::Readiness::Ok && !jsonOutput) {
+      PrintReadiness(readiness);
+      std::cout << "\n";
+    }
+
+    bool rootfsUsable = (readiness.state == RootFS::Readiness::Ok ||
+                         readiness.state == RootFS::Readiness::NoOverlay);
+    bool canWriteOverlay = (readiness.state == RootFS::Readiness::Ok);
+
+    if (!rootfsUsable) {
+      if (!readiness.auto_fixable) {
+        if (!jsonOutput) {
+          std::cout << "Nothing was read: there is no guest to resolve libraries against.\n";
+        }
+        return 1;
+      }
+      auto provision = RootFS::ProvisionOptionsFromSettings();
+      if (readiness.state == RootFS::Readiness::WrongArch) {
+        provision.dest = readiness.rootfs_path;
+        provision.force = true;
+      } else if (!readiness.requested.empty() &&
+                 readiness.requested.find('/') == std::string::npos) {
+        provision.name = readiness.requested;
+      }
+      auto plan = RootFS::BuildProvisionCommand(provision);
+
+      if (!wantBuild) {
+        if (!jsonOutput) {
+          std::cout << "Build the guest first, then ask again:\n"
+                    << "  sleeve libs " << name << " --build --yes\n"
+                    << "which runs:\n  " << Process::Describe(plan) << "\n";
+        }
+        return 1;
+      }
+      if (!jsonOutput) {
+        std::cout << "Building a guest downloads about 860 MB and writes about 1.9 GB:\n"
+                  << "  " << Process::Describe(plan) << "\n";
+      }
+      if (dryRun || !assumeYes) {
+        auto preview = provision;
+        preview.dry_run = true;
+        auto outcome = RootFS::Provision(preview);
+        if (!jsonOutput) {
+          std::cout << "\n" << outcome.output
+                    << (dryRun ? "Dry run: nothing was built.\n"
+                               : "Nothing was built. Pass --yes to build it.\n");
+        }
+        return 0;
+      }
+      auto outcome = RootFS::Provision(provision);
+      std::cout << outcome.output;
+      if (!outcome.ok) {
+        std::cerr << "Error: " << outcome.error << "\n";
+        return 1;
+      }
+      readiness = RootFS::CheckReadiness(rec->rootfs);
+      PrintReadiness(readiness);
+      std::cout << "\n";
+      canWriteOverlay = (readiness.state == RootFS::Readiness::Ok);
+      if (readiness.state != RootFS::Readiness::Ok) return 1;
+    }
+
+    if ((wantSync || wantInstall) && !canWriteOverlay) {
+      std::cerr << "Error: refusing to write into " << readiness.rootfs_path
+                << ": " << readiness.summary << "\n";
+      return 1;
+    }
+
+    auto scanOpt = Libs::OptionsForRecord(*rec);
+
+    // pacman -Fy downloads into the overlay, which every guest on this machine shares.
+    // It is a write, so it is asked for by name and never happens on the way past.
+    if (wantSync) {
+      auto preview = Libs::BuildGuestPacmanCommand(rec->rootfs, {"-Fy", "--noconfirm"}, 900.0);
+      std::cout << "Refreshing the guest file database writes into "
+                << (scanOpt.layers.overlay.empty() ? std::string("the rootfs") : scanOpt.layers.overlay)
+                << ":\n  " << Process::Describe(preview) << "\n";
+      if (dryRun || !assumeYes) {
+        std::cout << (dryRun ? "Dry run: nothing was downloaded.\n"
+                             : "Nothing was downloaded. Pass --yes to run it.\n");
+        if (!wantPackages && !wantInstall) return 0;
+      } else {
+        auto outcome = Libs::SyncFilesDatabase(rec->rootfs);
+        if (!outcome.ok) {
+          std::cerr << "Error: " << outcome.error << "\n" << outcome.output << "\n";
+          return 1;
+        }
+        std::cout << "Guest file database refreshed.\n\n";
+      }
+    }
+
+    // The dlopen half. Static analysis cannot see a dlopen, so the sonames a real run
+    // named are merged in: from the newest health log by default, and from a fresh run
+    // with --run.
+    std::string runSource;
+    if (wantRun) {
+      Health::CheckOptions hopt;
+      hopt.mode = Health::CheckMode::Version;
+      hopt.wmclass = rec->desktop.wmclass;
+      std::cout << "Running " << name << " once to see what it asks for...\n";
+      auto health = Health::RunCheck(*rec, hopt);
+      scanOpt.run_sonames = Libs::SonamesFromRunOutput(health.raw_stdout + "\n" + health.raw_stderr);
+      runSource = "this run";
+    } else if (useLog) {
+      std::string log = Libs::NewestHealthLog(name);
+      if (!log.empty()) {
+        std::ifstream lf(log);
+        std::stringstream lss;
+        lss << lf.rdbuf();
+        scanOpt.run_sonames = Libs::SonamesFromRunOutput(lss.str());
+        if (!scanOpt.run_sonames.empty()) runSource = Paths::ContractUser(log);
+      }
+    }
+
+    auto scan = Libs::ScanApp(scanOpt);
+
+    std::vector<std::string> unmetNames;
+    for (const auto& s : scan.unmet) unmetNames.push_back(s.soname);
+
+    Libs::PackagePlan plan;
+    if (wantPackages && !unmetNames.empty()) {
+      plan = Libs::MapSonamesToPackages(rec->rootfs, unmetNames);
+    } else if (wantPackages) {
+      plan.files_db_present = Libs::FilesDatabasePresent(scanOpt.layers);
+    }
+
+    if (jsonOutput) {
+      auto esc = [](const std::string& v) {
+        std::string o;
+        for (char c : v) {
+          if (c == '"' || c == '\\') { o += '\\'; o += c; }
+          else if (c == '\n') o += "\\n";
+          else o += c;
+        }
+        return o;
+      };
+      std::cout << "{\n  \"name\": \"" << esc(name) << "\",\n"
+                << "  \"exe\": \"" << esc(scanOpt.exe_path) << "\",\n"
+                << "  \"rootfs\": \"" << esc(scanOpt.layers.base) << "\",\n"
+                << "  \"overlay\": \"" << esc(scanOpt.layers.overlay) << "\",\n"
+                << "  \"objects_read\": " << scan.objects.size() << ",\n"
+                << "  \"files_probed\": " << scan.files_probed << ",\n"
+                << "  \"elapsed_seconds\": " << scan.elapsed_seconds << ",\n"
+                << "  \"sonames\": " << scan.all.size() << ",\n"
+                << "  \"unmet\": [\n";
+      for (size_t i = 0; i < scan.unmet.size(); ++i) {
+        const auto& u = scan.unmet[i];
+        std::cout << "    {\"soname\": \"" << esc(u.soname) << "\", \"layer\": \""
+                  << Libs::LayerName(u.layer) << "\", \"found_at\": \"" << esc(u.host_path)
+                  << "\", \"machine\": " << u.machine << ", \"discovered_by\": \""
+                  << u.discovered_by << "\", \"needed_by\": [";
+        for (size_t j = 0; j < u.needed_by.size(); ++j) {
+          std::cout << (j ? ", " : "") << "\"" << esc(u.needed_by[j]) << "\"";
+        }
+        std::cout << "]}" << (i + 1 < scan.unmet.size() ? "," : "") << "\n";
+      }
+      std::cout << "  ],\n  \"files_db_present\": " << (plan.files_db_present ? "true" : "false")
+                << ",\n  \"packages\": [";
+      for (size_t i = 0; i < plan.packages.size(); ++i) {
+        std::cout << (i ? ", " : "") << "\"" << esc(plan.packages[i]) << "\"";
+      }
+      std::cout << "],\n  \"unmatched\": [";
+      for (size_t i = 0; i < plan.unmatched.size(); ++i) {
+        std::cout << (i ? ", " : "") << "\"" << esc(plan.unmatched[i]) << "\"";
+      }
+      std::cout << "],\n  \"command\": \"" << esc(plan.command) << "\",\n"
+                << "  \"error\": \"" << esc(plan.error) << "\",\n"
+                << "  \"notes\": [";
+      for (size_t i = 0; i < scan.notes.size(); ++i) {
+        std::cout << (i ? ", " : "") << "\"" << esc(scan.notes[i]) << "\"";
+      }
+      std::cout << "]\n}\n";
+    } else {
+      std::cout << name << " (" << rec->shape << ")  " << Paths::ContractUser(scanOpt.exe_path) << "\n"
+                << "  rootfs   " << Paths::ContractUser(scanOpt.layers.base) << "\n"
+                << "  overlay  "
+                << (scanOpt.layers.overlay.empty() ? "(none)" : Paths::ContractUser(scanOpt.layers.overlay))
+                << "\n\n";
+
+      for (const auto& note : scan.notes) {
+        std::cout << "  ! " << note << "\n";
+      }
+      if (!scan.notes.empty()) std::cout << "\n";
+
+      std::cout << "Read " << scan.objects.size() << " ELF object(s), " << scan.files_probed
+                << " file(s) probed, in " << std::fixed << std::setprecision(1)
+                << scan.elapsed_seconds << " s.\n"
+                << scan.all.size() << " soname(s) named; " << scan.unmet.size() << " unmet.\n";
+      if (!runSource.empty()) {
+        std::cout << "Sonames a real run named were merged in from " << runSource << ".\n";
+      }
+      std::cout << "\n";
+
+      if (scan.unmet.empty()) {
+        std::cout << "Nothing is missing: every soname resolves in the overlay, the base rootfs or\n"
+                     "the application's own directory.\n";
+      } else {
+        std::cout << "Unmet libraries:\n";
+        for (const auto& u : scan.unmet) {
+          std::string where;
+          if (u.host_path.empty()) {
+            where = "no layer has it";
+          } else {
+            // Found, and still unmet: the only copy is of the wrong architecture, which
+            // the guest loader refuses and goes on searching past.
+            where = "only the host has it (" + Libs::MachineName(u.machine) +
+                    "), which the guest loader rejects";
+          }
+          std::string by;
+          for (size_t i = 0; i < u.needed_by.size(); ++i) by += (i ? ", " : "") + u.needed_by[i];
+          std::cout << "  " << std::left << std::setw(28) << u.soname
+                    << std::setw(10) << u.discovered_by << where;
+          if (!by.empty()) std::cout << "  <- " << by;
+          std::cout << "\n";
+        }
+        std::cout << "\nSearched, after each object's DT_RPATH/DT_RUNPATH and LD_LIBRARY_PATH,\n"
+                  << "overlay first and the base rootfs second:\n ";
+        for (const auto& d : scan.search_dirs) std::cout << " " << d;
+        std::cout << "\n";
+      }
+
+      if (wantPackages) {
+        std::cout << "\n";
+        if (!plan.error.empty()) {
+          std::cout << "Packages: " << plan.error << "\n";
+        } else if (scan.unmet.empty()) {
+          std::cout << "Packages: nothing to look up.\n";
+        } else {
+          std::cout << "Packages (guest pacman -F):\n";
+          for (const auto& m : plan.matches) {
+            std::cout << "  " << std::left << std::setw(28) << m.soname << "-> " << m.repo << "/"
+                      << m.package << " " << m.version << "  (" << m.path << ")\n";
+          }
+          for (const auto& s : plan.unmatched) {
+            std::cout << "  " << std::left << std::setw(28) << s << "-> no package owns it\n";
+          }
+          std::cout << "\nInstall set (" << plan.packages.size() << " package(s)):";
+          for (const auto& p : plan.packages) std::cout << " " << p;
+          std::cout << "\n";
+        }
+      }
+    }
+
+    if (!wantInstall) {
+      return scan.unmet.empty() ? 0 : 1;
+    }
+
+    if (plan.packages.empty()) {
+      if (!jsonOutput) std::cout << "\nNothing to install.\n";
+      return plan.error.empty() ? 0 : 1;
+    }
+
+    auto preview = Libs::BuildGuestPacmanCommand(rec->rootfs, [&]() {
+      std::vector<std::string> a = {"-S", "--needed", "--noconfirm"};
+      for (const auto& p : plan.packages) a.push_back(p);
+      return a;
+    }(), 1800.0);
+
+    if (!jsonOutput) {
+      std::cout << "\nInstalling into "
+                << (scanOpt.layers.overlay.empty() ? std::string("the rootfs")
+                                                   : Paths::ContractUser(scanOpt.layers.overlay))
+                << " changes what every guest using this rootfs sees.\n"
+                << "  " << Process::Describe(preview) << "\n";
+    }
+
+    if (dryRun || !assumeYes) {
+      if (!jsonOutput) {
+        std::cout << (dryRun ? "Dry run: nothing was installed.\n"
+                             : "Nothing was installed. Pass --yes to install.\n");
+      }
+      return 0;
+    }
+
+    auto outcome = Libs::InstallPackages(rec->rootfs, plan.packages);
+    if (!outcome.ok) {
+      std::cerr << "Error: " << outcome.error << "\n" << outcome.output << "\n";
+      return 1;
+    }
+    std::cout << "Installed " << plan.packages.size() << " package(s) into the overlay.\n";
+    return 0;
+  }
+
   // 9. ROOTFS
   if (cmd == "rootfs") {
+    if (filteredArgs.size() >= 2 && filteredArgs[1] == "check") {
+      auto report = RootFS::CheckReadiness(filteredArgs.size() >= 3 ? filteredArgs[2] : "");
+      if (jsonOutput) {
+        std::cout << "{\n  \"state\": \"" << ReadinessName(report.state) << "\",\n"
+                  << "  \"requested\": \"" << report.requested << "\",\n"
+                  << "  \"rootfs\": \"" << report.rootfs_path << "\",\n"
+                  << "  \"overlay\": \"" << report.overlay_path << "\",\n"
+                  << "  \"elf_machine\": " << report.elf_machine << ",\n"
+                  << "  \"guest_pacman\": " << (report.guest_pacman ? "true" : "false") << ",\n"
+                  << "  \"auto_fixable\": " << (report.auto_fixable ? "true" : "false") << ",\n"
+                  << "  \"summary\": \"" << report.summary << "\",\n"
+                  << "  \"fix\": \"" << report.fix_hint << "\"\n}\n";
+      } else {
+        PrintReadiness(report);
+      }
+      return report.state == RootFS::Readiness::Ok ? 0 : 1;
+    }
+
+    if (filteredArgs.size() >= 2 && filteredArgs[1] == "build") {
+      // Mirrors come from the settings file and are passed straight through; sleeve holds
+      // no opinion about where packages come from, because the fetcher already does.
+      auto provision = RootFS::ProvisionOptionsFromSettings();
+      bool overlayOnly = false;
+      for (size_t i = 2; i < filteredArgs.size(); ++i) {
+        const std::string& opt = filteredArgs[i];
+        if (opt == "--force") provision.force = true;
+        else if (opt == "--overlay-only") overlayOnly = true;
+        else if (opt == "--no-set-default") provision.set_default = false;
+        else if (opt.rfind("--manifest=", 0) == 0) provision.manifest = opt.substr(11);
+        else if (opt == "--manifest" && i + 1 < filteredArgs.size()) provision.manifest = filteredArgs[++i];
+        else if (opt.rfind("--dest=", 0) == 0) provision.dest = opt.substr(7);
+        else if (opt == "--dest" && i + 1 < filteredArgs.size()) provision.dest = filteredArgs[++i];
+        else if (opt.rfind("--mirror=", 0) == 0) provision.mirrors.push_back(opt.substr(9));
+        else if (opt[0] != '-' && provision.name.empty()) provision.name = opt;
+        else {
+          std::cerr << "Error: unknown option for 'sleeve rootfs build': " << opt << "\n";
+          return 1;
+        }
+      }
+
+      auto plan = overlayOnly ? RootFS::BuildOverlayCommand(provision)
+                              : RootFS::BuildProvisionCommand(provision);
+      std::cout << "Building a guest downloads about 860 MB and writes about 1.9 GB, and the\n"
+                << "overlay it creates is shared by every guest that uses this rootfs.\n"
+                << "  " << Process::Describe(plan) << "\n";
+      if (!provision.mirrors.empty()) {
+        std::cout << "  mirrors from " << Paths::ContractUser(Paths::GetSettingsPath())
+                  << ", tried in order\n";
+      }
+
+      if (dryRun || !assumeYes) {
+        // --dry-run goes to the fetcher too: it prints the plan it would carry out --
+        // the manifest, the package count, the download size -- and downloads nothing.
+        auto preview = provision;
+        preview.dry_run = true;
+        auto outcome = overlayOnly ? RootFS::ProvisionOverlay(preview) : RootFS::Provision(preview);
+        std::cout << "\n" << outcome.output;
+        std::cout << (dryRun ? "Dry run: nothing was built.\n"
+                             : "Nothing was built. Pass --yes to build it.\n");
+        return 0;
+      }
+
+      auto outcome = overlayOnly ? RootFS::ProvisionOverlay(provision) : RootFS::Provision(provision);
+      std::cout << outcome.output;
+      if (!outcome.ok) {
+        std::cerr << "Error: " << outcome.error << "\n";
+        return 1;
+      }
+      auto after = RootFS::CheckReadiness(provision.name);
+      PrintReadiness(after);
+      return after.state == RootFS::Readiness::Ok ? 0 : 1;
+    }
+
     if (filteredArgs.size() >= 3 && filteredArgs[1] == "use") {
       // A name that does not resolve does not fail loudly at run time: the emulator falls
       // back to host binaries. Refuse it here instead.

@@ -8,15 +8,20 @@
 #include "FileWriter.h"
 #include "Generate.h"
 #include "Health.h"
+#include "Libs.h"
 #include "Paths.h"
+#include "Process.h"
+#include "RootFS.h"
 #include "Scanner.h"
 #include "Theme.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace Sleeve::Tui {
 
@@ -284,10 +289,11 @@ bool PrepareHealthCheck(AppState& state) {
     return false;
   }
   const auto& rec = state.records[state.selected_app_index];
-  state.pending_launch.active = true;
-  state.pending_launch.app_name = rec.name;
-  state.pending_launch.command = DescribeHealthCommand(rec);
-  state.pending_launch.warning =
+  state.pending_confirm.active = true;
+  state.pending_confirm.title = "Health check: " + rec.name;
+  state.pending_confirm.command = DescribeHealthCommand(rec);
+  state.pending_confirm.on_accept = [&state]() { StartHealthCheck(state); };
+  state.pending_confirm.warning =
       "This starts " + rec.title +
       " for real, under the emulator. A windowed application will put a window on "
       "screen over this terminal, and it keeps running until it exits or Core's "
@@ -338,10 +344,302 @@ bool StartHealthCheck(AppState& state) {
 
   bool started = state.job.Start(std::move(req));
   if (started) {
-    state.pending_launch = AppState::PendingLaunch{};
     state.status_line.clear();
   }
   return started;
+}
+
+
+// ---------------------------------------------------------------------------
+// Libraries
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct LibsWork {
+  Record::AppRecord record;
+  RootFS::ReadinessReport readiness;
+  Libs::ScanResult scan;
+  Libs::PackagePlan plan;
+};
+
+// The unmet sonames, in the order the report shows them.
+std::vector<std::string> UnmetNames(const Libs::ScanResult& scan) {
+  std::vector<std::string> names;
+  for (const auto& u : scan.unmet) names.push_back(u.soname);
+  return names;
+}
+
+} // namespace
+
+bool StartLibsScan(AppState& state) {
+  if (state.selected_app_index < 0 ||
+      state.selected_app_index >= static_cast<int>(state.records.size())) {
+    return false;
+  }
+
+  auto work = std::make_shared<LibsWork>();
+  work->record = state.records[state.selected_app_index];
+
+  Job::Request req;
+  req.label = "Reading what " + work->record.name + " needs";
+  req.cancel_hint = "[esc] cancel — a scan reads and writes nothing";
+  req.cancellable = true;
+  req.work = [work](JobToken& token) {
+    token.Progress("checking the rootfs");
+    work->readiness = RootFS::CheckReadiness(work->record.rootfs);
+    if (token.Cancelled()) {
+      return;
+    }
+    if (work->readiness.state == RootFS::Readiness::Missing ||
+        work->readiness.state == RootFS::Readiness::WrongArch) {
+      return; // nothing to resolve against; the screen offers to build one
+    }
+    auto opt = Libs::OptionsForRecord(work->record);
+    // The dlopen half, for free: a library loaded by name at run time is invisible to
+    // every ELF header, but the last health check's log names the ones that failed.
+    std::string log = Libs::NewestHealthLog(work->record.name);
+    if (!log.empty()) {
+      std::ifstream f(log);
+      std::stringstream ss;
+      ss << f.rdbuf();
+      opt.run_sonames = Libs::SonamesFromRunOutput(ss.str());
+    }
+    token.Progress("walking the application's ELF objects");
+    work->scan = Libs::ScanApp(opt);
+  };
+  req.deliver = [&state, work]() {
+    state.libs_readiness = work->readiness;
+    state.libs_result = std::move(work->scan);
+    state.libs_plan = Libs::PackagePlan {};
+    state.libs_scanned = true;
+    state.current_tab = ScreenTab::Libs;
+    if (work->readiness.state == RootFS::Readiness::Missing ||
+        work->readiness.state == RootFS::Readiness::WrongArch) {
+      state.status_line = "no usable guest: " + work->readiness.summary;
+    } else {
+      state.status_line = std::to_string(state.libs_result.unmet.size()) + " unmet of " +
+                          std::to_string(state.libs_result.all.size()) + " soname(s) · " +
+                          std::to_string(state.libs_result.objects.size()) + " object(s) read";
+    }
+  };
+  if (state.job.Start(std::move(req))) {
+    state.status_line.clear();
+    return true;
+  }
+  return false;
+}
+
+bool StartLibsPackages(AppState& state) {
+  if (state.libs_result.unmet.empty()) {
+    state.status_line = "nothing unmet to look up";
+    return false;
+  }
+  if (state.selected_app_index < 0 ||
+      state.selected_app_index >= static_cast<int>(state.records.size())) {
+    return false;
+  }
+
+  auto work = std::make_shared<LibsWork>();
+  work->record = state.records[state.selected_app_index];
+  auto sonames = std::make_shared<std::vector<std::string>>(UnmetNames(state.libs_result));
+
+  Job::Request req;
+  req.label = "Asking guest pacman which packages own them";
+  req.cancel_hint = "[esc] stop waiting (the query reads, it does not install)";
+  req.cancellable = true;
+  req.work = [work, sonames](JobToken& token) {
+    token.Progress("pacman -F, under the emulator");
+    if (token.Cancelled()) {
+      return;
+    }
+    work->plan = Libs::MapSonamesToPackages(work->record.rootfs, *sonames);
+  };
+  req.deliver = [&state, work]() {
+    state.libs_plan = std::move(work->plan);
+    state.current_tab = ScreenTab::Libs;
+    state.status_line = state.libs_plan.error.empty()
+                            ? (std::to_string(state.libs_plan.packages.size()) +
+                               " package(s) would cover it")
+                            : state.libs_plan.error;
+  };
+  if (state.job.Start(std::move(req))) {
+    state.status_line.clear();
+    return true;
+  }
+  return false;
+}
+
+namespace {
+
+// Starts one guest pacman action as a job. Both of them mutate the overlay, so both come
+// through the confirmation panel first.
+bool StartGuestPacman(AppState& state, const std::string& label,
+                      std::function<Process::RunOutcome()> action) {
+  auto work = std::make_shared<Process::RunOutcome>();
+
+  Job::Request req;
+  req.label = label;
+  // Stopping halfway through a package transaction leaves the overlay with files from a
+  // package its database does not list, which is worse than waiting.
+  req.cancel_hint = "guest pacman cannot be interrupted safely";
+  req.cancellable = false;
+  req.work = [work, action](JobToken& token) {
+    token.Progress("running guest pacman under the emulator");
+    *work = action();
+    if (!work->ok) {
+      token.Fail(work->error);
+    }
+  };
+  req.deliver = [&state, work]() {
+    state.current_tab = ScreenTab::Libs;
+    state.status_line =
+        work->ok ? "guest pacman finished" : ("guest pacman failed: " + work->error);
+    if (work->ok) {
+      // What is unmet has changed, so the report on screen is stale. Say so rather than
+      // leaving a list that no longer describes the guest.
+      state.libs_scanned = false;
+      state.libs_result = Libs::ScanResult {};
+      state.libs_plan = Libs::PackagePlan {};
+      state.status_line += " — press [l] to read the application again";
+    }
+  };
+  if (state.job.Start(std::move(req))) {
+    state.status_line.clear();
+    return true;
+  }
+  return false;
+}
+
+} // namespace
+
+bool PrepareLibsInstall(AppState& state) {
+  if (state.job.Running()) {
+    return false;
+  }
+  if (state.libs_plan.packages.empty()) {
+    state.status_line = state.libs_plan.error.empty()
+                            ? "no package set yet — press [p] to look them up"
+                            : state.libs_plan.error;
+    return false;
+  }
+  if (state.libs_readiness.state != RootFS::Readiness::Ok) {
+    state.status_line = "refusing to write into this rootfs: " + state.libs_readiness.summary;
+    return false;
+  }
+  if (state.selected_app_index < 0 ||
+      state.selected_app_index >= static_cast<int>(state.records.size())) {
+    return false;
+  }
+
+  std::string rootfs = state.records[state.selected_app_index].rootfs;
+  std::vector<std::string> packages = state.libs_plan.packages;
+
+  std::vector<std::string> args = {"-S", "--needed", "--noconfirm"};
+  for (const auto& p : packages) args.push_back(p);
+
+  state.pending_confirm.active = true;
+  state.pending_confirm.title = "Install " + std::to_string(packages.size()) + " package(s)";
+  state.pending_confirm.command =
+      Process::Describe(Libs::BuildGuestPacmanCommand(rootfs, args, 1800.0));
+  state.pending_confirm.warning =
+      "This installs into " + state.libs_readiness.overlay_path +
+      ", which every guest using this rootfs shares — including the sessions running right "
+      "now. It cannot be undone from here.";
+  state.pending_confirm.on_accept = [&state, rootfs, packages]() {
+    StartGuestPacman(state, "Installing " + std::to_string(packages.size()) + " package(s)",
+                     [rootfs, packages]() { return Libs::InstallPackages(rootfs, packages); });
+  };
+  return true;
+}
+
+bool PrepareLibsSync(AppState& state) {
+  if (state.job.Running()) {
+    return false;
+  }
+  if (state.libs_readiness.state != RootFS::Readiness::Ok) {
+    state.status_line = "refusing to write into this rootfs: " + state.libs_readiness.summary;
+    return false;
+  }
+  if (state.selected_app_index < 0 ||
+      state.selected_app_index >= static_cast<int>(state.records.size())) {
+    return false;
+  }
+
+  std::string rootfs = state.records[state.selected_app_index].rootfs;
+  state.pending_confirm.active = true;
+  state.pending_confirm.title = "Refresh the guest file database";
+  state.pending_confirm.command =
+      Process::Describe(Libs::BuildGuestPacmanCommand(rootfs, {"-Fy", "--noconfirm"}, 900.0));
+  state.pending_confirm.warning =
+      "Tracing a soname to a package needs the file database, and that is a download into " +
+      state.libs_readiness.overlay_path + ". Nothing is installed by it.";
+  state.pending_confirm.on_accept = [&state, rootfs]() {
+    StartGuestPacman(state, "Refreshing the guest file database",
+                     [rootfs]() { return Libs::SyncFilesDatabase(rootfs); });
+  };
+  return true;
+}
+
+bool PrepareRootFSBuild(AppState& state) {
+  if (state.job.Running()) {
+    return false;
+  }
+  if (!state.libs_readiness.auto_fixable) {
+    state.status_line = state.libs_readiness.state == RootFS::Readiness::Ok
+                            ? "the rootfs is fine; nothing to build"
+                            : ("this one is yours to repair: " + state.libs_readiness.fix_hint);
+    return false;
+  }
+
+  // Mirrors come from the settings file and are passed straight through. sleeve holds no
+  // opinion about where packages come from; the fetcher already has one.
+  auto provision = RootFS::ProvisionOptionsFromSettings();
+  if (state.libs_readiness.state == RootFS::Readiness::WrongArch) {
+    provision.dest = state.libs_readiness.rootfs_path;
+    provision.force = true;
+  } else if (!state.libs_readiness.requested.empty() &&
+             state.libs_readiness.requested.find('/') == std::string::npos) {
+    provision.name = state.libs_readiness.requested;
+  }
+
+  state.pending_confirm.active = true;
+  state.pending_confirm.title = "Build a guest rootfs";
+  state.pending_confirm.command = Process::Describe(RootFS::BuildProvisionCommand(provision));
+  state.pending_confirm.warning =
+      "This downloads about 860 MB and writes about 1.9 GB, and it can take a long while. "
+      "It builds the base, the per-user overlay and guest pacman, and points the config at "
+      "the result.";
+  state.pending_confirm.on_accept = [&state, provision]() {
+    auto work = std::make_shared<Process::RunOutcome>();
+    Job::Request req;
+    req.label = "Building a guest rootfs";
+    req.cancel_hint = "a half-extracted rootfs is worse than a wait";
+    req.cancellable = false;
+    req.work = [work, provision](JobToken& token) {
+      token.Progress("POWERarmRootFSFetcher build — this downloads a lot");
+      *work = RootFS::Provision(provision);
+      if (!work->ok) {
+        token.Fail(work->error);
+      }
+    };
+    req.deliver = [&state, work]() {
+      state.Refresh();
+      state.libs_readiness = RootFS::CheckReadiness(
+          state.selected_app_index >= 0 &&
+                  state.selected_app_index < static_cast<int>(state.records.size())
+              ? state.records[state.selected_app_index].rootfs
+              : std::string());
+      state.libs_scanned = false;
+      state.current_tab = ScreenTab::Libs;
+      state.status_line = work->ok ? "rootfs built — press [l] to read the application again"
+                                   : ("build failed: " + work->error);
+    };
+    if (state.job.Start(std::move(req))) {
+      state.status_line.clear();
+    }
+  };
+  return true;
 }
 
 } // namespace Sleeve::Tui
