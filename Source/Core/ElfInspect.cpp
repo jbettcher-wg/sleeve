@@ -99,6 +99,26 @@ std::optional<ElfDetails> InspectTarget(const std::string& path) {
   if (!IsTargetBinary(probe)) {
     return std::nullopt;
   }
+  return InspectElf64(path);
+}
+
+// DT_RPATH and DT_RUNPATH are one string of colon-separated directories.
+static void AppendSplitPaths(const char* value, std::vector<std::string>& out) {
+  std::string all(value);
+  size_t start = 0;
+  while (start <= all.size()) {
+    size_t colon = all.find(':', start);
+    std::string part = all.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
+    if (!part.empty()) {
+      out.push_back(part);
+    }
+    if (colon == std::string::npos) break;
+    start = colon + 1;
+  }
+}
+
+std::optional<ElfDetails> InspectElf64(const std::string& path) {
+  ProbeResult probe = ProbeFile(path);
 
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
@@ -113,6 +133,15 @@ std::optional<ElfDetails> InspectTarget(const std::string& path) {
 
   Elf64_Ehdr ehdr;
   if (::pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
+    ::close(fd);
+    return std::nullopt;
+  }
+
+  // Everything below reads Elf64 little-endian structures. A 32-bit or big-endian file
+  // gets its header fields from the wrong offsets, so refuse it here rather than
+  // reporting the garbage that comes out.
+  if (std::memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 || ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+      ehdr.e_ident[EI_DATA] != ELFDATA2LSB) {
     ::close(fd);
     return std::nullopt;
   }
@@ -172,6 +201,10 @@ std::optional<ElfDetails> InspectTarget(const std::string& path) {
       uint64_t strtab_va = 0;
       uint64_t strtab_sz = 0;
       std::vector<uint64_t> needed_offsets;
+      std::vector<uint64_t> rpath_offsets;
+      std::vector<uint64_t> runpath_offsets;
+      uint64_t soname_offset = 0;
+      bool has_soname = false;
 
       for (const auto& dyn : dyns) {
         if (dyn.d_tag == DT_STRTAB) {
@@ -180,6 +213,13 @@ std::optional<ElfDetails> InspectTarget(const std::string& path) {
           strtab_sz = dyn.d_un.d_val;
         } else if (dyn.d_tag == DT_NEEDED) {
           needed_offsets.push_back(dyn.d_un.d_val);
+        } else if (dyn.d_tag == DT_RPATH) {
+          rpath_offsets.push_back(dyn.d_un.d_val);
+        } else if (dyn.d_tag == DT_RUNPATH) {
+          runpath_offsets.push_back(dyn.d_un.d_val);
+        } else if (dyn.d_tag == DT_SONAME) {
+          soname_offset = dyn.d_un.d_val;
+          has_soname = true;
         } else if (dyn.d_tag == DT_NULL) {
           break;
         }
@@ -189,11 +229,26 @@ std::optional<ElfDetails> InspectTarget(const std::string& path) {
       if (strtab_offset >= 0 && strtab_sz > 0 && strtab_sz < 10 * 1024 * 1024) {
         std::vector<char> strtab(strtab_sz);
         if (::pread(fd, strtab.data(), strtab_sz, strtab_offset) == static_cast<ssize_t>(strtab_sz)) {
+          // A string table read off disk is not guaranteed to end in a NUL, and every
+          // read below is a C string walk from an attacker-supplied offset.
+          strtab.back() = '\0';
           for (auto off : needed_offsets) {
             if (off < strtab_sz) {
-              const char* str = strtab.data() + off;
-              details.needed_libs.push_back(std::string(str));
+              details.needed_libs.push_back(std::string(strtab.data() + off));
             }
+          }
+          for (auto off : rpath_offsets) {
+            if (off < strtab_sz) {
+              AppendSplitPaths(strtab.data() + off, details.rpath);
+            }
+          }
+          for (auto off : runpath_offsets) {
+            if (off < strtab_sz) {
+              AppendSplitPaths(strtab.data() + off, details.runpath);
+            }
+          }
+          if (has_soname && soname_offset < strtab_sz) {
+            details.soname = std::string(strtab.data() + soname_offset);
           }
         }
       }

@@ -34,6 +34,13 @@ struct ElfDetails {
   ProbeResult probe;
   std::string interpreter;
   std::vector<std::string> needed_libs;
+  // DT_SONAME, "" when the object does not carry one.
+  std::string soname;
+  // DT_RPATH and DT_RUNPATH, already split on ':'. Tokens ($ORIGIN, $LIB, $PLATFORM)
+  // are left as they appear; expanding them needs the path of the object doing the
+  // loading, which is the caller's business.
+  std::vector<std::string> rpath;
+  std::vector<std::string> runpath;
   uint64_t file_size {0};
 };
 
@@ -44,7 +51,13 @@ ProbeResult ProbeFile(const std::string& path);
 bool IsTargetBinary(const ProbeResult& probe);
 
 // Detailed inspection for binaries of the active backend's guest architecture
-// (reads PT_INTERP, DT_NEEDED). The parse itself is plain ELF64.
+// (reads PT_INTERP, DT_NEEDED, DT_SONAME, DT_RPATH, DT_RUNPATH). The parse itself is
+// plain ELF64.
 std::optional<ElfDetails> InspectTarget(const std::string& path);
+
+// The same parse without the architecture gate. The dependency walk needs it: a library
+// found in the rootfs is read for its own DT_NEEDED whatever its e_machine turns out to
+// be, and reporting the machine is the point when it turns out to be the wrong one.
+std::optional<ElfDetails> InspectElf64(const std::string& path);
 
 } // namespace Sleeve::ElfInspect

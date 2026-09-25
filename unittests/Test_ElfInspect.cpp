@@ -2,9 +2,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include "ElfInspect.h"
 #include "Backend.h"
+#include "TestEnv.h"
 #include <elf.h>
 #include <fstream>
 #include <filesystem>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace Sleeve::ElfInspect;
@@ -156,4 +158,54 @@ TEST_CASE("ElfInspect: Position-independent executables count as target binaries
 
   REQUIRE(Sleeve::Backend::SetActiveBackend("powerarm"));
   fs::remove_all(tmpDir);
+}
+
+TEST_CASE("ElfInspect: the dynamic section gives up its search paths, not just its needs",
+          "[sleeve][elf]") {
+  // The dependency walk stands on these: a bundled application finds the libraries it
+  // ships through DT_RUNPATH=$ORIGIN, and without reading them every one of them reads
+  // as missing.
+  SleeveTest::ScopedTestHome home("elf-dynamic");
+  REQUIRE(Sleeve::Backend::SetActiveBackend("powerarm"));
+
+  SleeveTest::DynamicElfSpec spec;
+  spec.soname = "libthing.so.1";
+  spec.needed = {"libc.so.6", "libm.so.6"};
+  spec.runpath = {"$ORIGIN", "$ORIGIN/../lib"};
+  auto path = home.Root() / "libthing.so.1";
+  SleeveTest::WriteDynamicElf(path, spec);
+
+  auto details = InspectTarget(path.string());
+  REQUIRE(details.has_value());
+  CHECK(details->soname == "libthing.so.1");
+  CHECK(details->needed_libs == std::vector<std::string> {"libc.so.6", "libm.so.6"});
+  // One DT_RUNPATH string, split on ':' the way the loader splits it.
+  CHECK(details->runpath == std::vector<std::string> {"$ORIGIN", "$ORIGIN/../lib"});
+  CHECK(details->rpath.empty());
+
+  SECTION("DT_RPATH is kept apart from DT_RUNPATH, because the loader treats them apart") {
+    SleeveTest::DynamicElfSpec old;
+    old.needed = {"libc.so.6"};
+    old.rpath = {"/opt/app/lib"};
+    auto oldPath = home.Root() / "libold.so.1";
+    SleeveTest::WriteDynamicElf(oldPath, old);
+
+    auto oldDetails = InspectTarget(oldPath.string());
+    REQUIRE(oldDetails.has_value());
+    CHECK(oldDetails->rpath == std::vector<std::string> {"/opt/app/lib"});
+    CHECK(oldDetails->runpath.empty());
+  }
+
+  SECTION("a foreign object is still readable when the architecture gate is not applied") {
+    SleeveTest::DynamicElfSpec foreign;
+    foreign.machine = SleeveTest::kMachineX86_64;
+    foreign.needed = {"libfoo.so.1"};
+    auto foreignPath = home.Root() / "libforeign.so";
+    SleeveTest::WriteDynamicElf(foreignPath, foreign);
+
+    CHECK_FALSE(InspectTarget(foreignPath.string()).has_value());
+    auto any = InspectElf64(foreignPath.string());
+    REQUIRE(any.has_value());
+    CHECK(any->probe.machine == SleeveTest::kMachineX86_64);
+  }
 }
